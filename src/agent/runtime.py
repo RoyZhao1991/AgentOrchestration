@@ -4,6 +4,8 @@ import os
 import signal
 import subprocess
 import logging
+import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Optional
 
@@ -18,10 +20,20 @@ class RuntimeState(Enum):
     CRASHED = "crashed"
 
 
+@dataclass(frozen=True)
+class RuntimeTerminalOutcome:
+    agent_id: str
+    state: RuntimeState
+    reason: str
+    return_code: Optional[int]
+    recorded_at: float
+
+
 class AgentRuntime:
     def __init__(self):
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
+        self._terminal_outcomes: Dict[str, RuntimeTerminalOutcome] = {}
 
     def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
         if agent_id in self._processes and self._processes[agent_id].poll() is None:
@@ -29,6 +41,7 @@ class AgentRuntime:
             return False
 
         self._states[agent_id] = RuntimeState.STARTING
+        self._terminal_outcomes.pop(agent_id, None)
         process_env = os.environ.copy()
         if env:
             process_env.update(env)
@@ -46,36 +59,95 @@ class AgentRuntime:
             logger.info(f"Agent {agent_id} started (PID: {proc.pid})")
             return True
         except Exception as e:
-            self._states[agent_id] = RuntimeState.CRASHED
+            self._record_terminal_outcome(
+                agent_id,
+                RuntimeState.CRASHED,
+                f"failed to start: {e}",
+                return_code=None,
+            )
             logger.error(f"Failed to start agent {agent_id}: {e}")
             return False
 
     def stop(self, agent_id: str, timeout: int = 10) -> bool:
         proc = self._processes.get(agent_id)
         if not proc or proc.poll() is not None:
+            self.get_state(agent_id)
             return False
 
         self._states[agent_id] = RuntimeState.STOPPING
         proc.send_signal(signal.SIGTERM)
+        reason = "stopped by request"
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+            reason = f"shutdown timed out after {timeout}s; process killed"
 
+        self._record_terminal_outcome(
+            agent_id,
+            RuntimeState.STOPPED,
+            reason,
+            return_code=proc.returncode,
+        )
         self._states[agent_id] = RuntimeState.STOPPED
+        self._processes.pop(agent_id, None)
         logger.info(f"Agent {agent_id} stopped")
         return True
 
     def get_state(self, agent_id: str) -> RuntimeState:
         proc = self._processes.get(agent_id)
         if proc and proc.poll() is not None:
-            self._states[agent_id] = RuntimeState.CRASHED
+            self._record_terminal_outcome(
+                agent_id,
+                RuntimeState.CRASHED,
+                self._failure_reason(proc.returncode),
+                return_code=proc.returncode,
+            )
+            self._processes.pop(agent_id, None)
         return self._states.get(agent_id, RuntimeState.STOPPED)
+
+    def get_failure_reason(self, agent_id: str) -> Optional[str]:
+        self.get_state(agent_id)
+        outcome = self._terminal_outcomes.get(agent_id)
+        if outcome and outcome.state == RuntimeState.CRASHED:
+            return outcome.reason
+        if outcome and "killed" in outcome.reason:
+            return outcome.reason
+        return None
+
+    def get_terminal_outcome(self, agent_id: str) -> Optional[RuntimeTerminalOutcome]:
+        self.get_state(agent_id)
+        return self._terminal_outcomes.get(agent_id)
 
     def is_running(self, agent_id: str) -> bool:
         proc = self._processes.get(agent_id)
         return proc is not None and proc.poll() is None
+
+    def _record_terminal_outcome(
+        self,
+        agent_id: str,
+        state: RuntimeState,
+        reason: str,
+        return_code: Optional[int],
+    ) -> None:
+        if agent_id in self._terminal_outcomes:
+            return
+        self._terminal_outcomes[agent_id] = RuntimeTerminalOutcome(
+            agent_id=agent_id,
+            state=state,
+            reason=reason,
+            return_code=return_code,
+            recorded_at=time.time(),
+        )
+        self._states[agent_id] = state
+
+    def _failure_reason(self, return_code: Optional[int]) -> str:
+        if return_code is None:
+            return "process exit status unavailable"
+        if return_code < 0:
+            return f"process terminated by signal {-return_code}"
+        return f"process exited with code {return_code}"
 
 # 2019-01-11T10:56:26 update
 
