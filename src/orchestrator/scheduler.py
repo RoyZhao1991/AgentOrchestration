@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,31 +30,60 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, reservation_timeout: float = 30.0):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._audit_events: List[Dict] = []
         self._max_retries = 3
+        self._reservation_timeout = reservation_timeout
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        self._clear_reservation(task)
 
+        self._enqueue_ready(task, queue, priority)
+        return task_id
+
+    def _enqueue_ready(self, task: Dict, queue: str, priority: int) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
+        task["queue"] = queue
+        task["priority"] = priority
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        worker_id: Optional[str] = None,
+        reservation_timeout: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> Optional[Dict]:
+        now = now if now is not None else time.time()
+        self.reclaim_abandoned_reservations(queue=queue, now=now)
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
             task = self._scheduled.pop(tid)
@@ -65,21 +93,180 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                self._reserve_task(
+                    task,
+                    queue=queue,
+                    worker_id=worker_id,
+                    now=now,
+                    reservation_timeout=reservation_timeout,
+                )
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def complete(
+        self,
+        task_id: str,
+        reservation_token: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            return False
+        if not self._reservation_matches(task, reservation_token):
+            self._audit("completion_rejected", task, "stale_reservation")
+            return False
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+        self._in_flight.pop(task_id)
+        self._audit("completed", task, "worker_ack")
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        reservation_token: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            return False
+        if not self._reservation_matches(task, reservation_token):
+            self._audit("failure_rejected", task, "stale_reservation")
+            return False
+
+        self._in_flight.pop(task_id)
+        task["retries"] += 1
+        if task["retries"] < self._max_retries:
+            self.enqueue(
+                task,
+                queue=task.get("queue", queue),
+                priority=task.get("priority", 0),
+            )
+            self._audit("retry_requeued", task, "worker_failure")
+            return True
         return False
+
+    def worker_disconnected(
+        self,
+        worker_id: str,
+        queue: str = "default",
+        now: Optional[float] = None,
+    ) -> int:
+        now = now if now is not None else time.time()
+        reclaimed = 0
+
+        for task_id, task in list(self._in_flight.items()):
+            if task.get("reserved_by") != worker_id:
+                continue
+
+            if self._requeue_reserved_task(
+                task_id,
+                task,
+                queue=task.get("queue", queue),
+                now=now,
+                reason="worker_disconnected",
+            ):
+                reclaimed += 1
+
+        return reclaimed
+
+    def reclaim_abandoned_reservations(
+        self,
+        queue: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> int:
+        now = now if now is not None else time.time()
+        reclaimed = 0
+
+        for task_id, task in list(self._in_flight.items()):
+            expires_at = task.get("reservation_expires_at")
+            if expires_at is None or expires_at > now:
+                continue
+            if queue is not None and task.get("queue") != queue:
+                continue
+
+            if self._requeue_reserved_task(
+                task_id,
+                task,
+                queue=task.get("queue", queue or "default"),
+                now=now,
+                reason="reservation_expired",
+            ):
+                reclaimed += 1
+
+        return reclaimed
+
+    def audit_events(self) -> List[Dict]:
+        return list(self._audit_events)
+
+    def _reserve_task(
+        self,
+        task: Dict,
+        queue: str,
+        worker_id: Optional[str],
+        now: float,
+        reservation_timeout: Optional[float],
+    ) -> None:
+        timeout = reservation_timeout or self._reservation_timeout
+        task["queue"] = queue
+        task["reserved_by"] = worker_id
+        task["reserved_at"] = now
+        task["reservation_expires_at"] = now + timeout
+        task["reservation_token"] = str(uuid4())
+        self._audit("reserved", task, "worker_claim")
+
+    def _requeue_reserved_task(
+        self,
+        task_id: str,
+        task: Dict,
+        queue: str,
+        now: float,
+        reason: str,
+    ) -> bool:
+        if self._in_flight.pop(task_id, None) is None:
+            return False
+
+        task["reservation_reclaims"] = task.get("reservation_reclaims", 0) + 1
+        task["reclaimed_at"] = now
+        task["enqueued_at"] = now
+        worker_id = task.get("reserved_by")
+        self._clear_reservation(task)
+        self._enqueue_ready(task, queue, task.get("priority", 0))
+        self._audit("reservation_requeued", task, reason, worker_id=worker_id)
+        return True
+
+    def _clear_reservation(self, task: Dict) -> None:
+        task.pop("reserved_by", None)
+        task.pop("reserved_at", None)
+        task.pop("reservation_expires_at", None)
+        task.pop("reservation_token", None)
+
+    def _reservation_matches(
+        self,
+        task: Dict,
+        reservation_token: Optional[str],
+    ) -> bool:
+        if reservation_token is None:
+            return True
+        return task.get("reservation_token") == reservation_token
+
+    def _audit(
+        self,
+        action: str,
+        task: Dict,
+        reason: str,
+        worker_id: Optional[str] = None,
+    ) -> None:
+        self._audit_events.append(
+            {
+                "action": action,
+                "task_id": task.get("id"),
+                "queue": task.get("queue", "default"),
+                "worker_id": worker_id
+                if worker_id is not None
+                else task.get("reserved_by"),
+                "reason": reason,
+            },
+        )
 
 # 2019-04-25T08:37:12 update
 

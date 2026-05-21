@@ -1,5 +1,17 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
+
+
+async def dequeue_now(
+    scheduler,
+    worker_id="worker-1",
+    now=100.0,
+    reservation_timeout=10.0,
+):
+    return await scheduler.dequeue(
+        worker_id=worker_id,
+        now=now,
+        reservation_timeout=reservation_timeout,
+    )
 
 
 class TestTaskScheduler:
@@ -35,6 +47,110 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_worker_disconnect_reclaims_reserved_task_once(self):
+        self.scheduler.enqueue({
+            "type": "test",
+            "payload": {"private": "data"},
+        })
+
+        import asyncio
+        task = asyncio.run(dequeue_now(self.scheduler, worker_id="worker-a"))
+        task_id = task["id"]
+
+        assert self.scheduler.worker_disconnected("worker-a", now=101.0) == 1
+        assert self.scheduler.worker_disconnected("worker-a", now=102.0) == 0
+
+        reclaimed = asyncio.run(
+            dequeue_now(self.scheduler, worker_id="worker-b", now=103.0),
+        )
+
+        assert reclaimed["id"] == task_id
+        assert reclaimed["reserved_by"] == "worker-b"
+        assert reclaimed["reservation_reclaims"] == 1
+
+        events = self.scheduler.audit_events()
+        assert events[-2]["action"] == "reservation_requeued"
+        assert events[-2]["reason"] == "worker_disconnected"
+        assert "payload" not in events[-2]
+
+    def test_worker_disconnect_preserves_other_worker_reservations(self):
+        self.scheduler.enqueue({"type": "worker-a"}, priority=2)
+        self.scheduler.enqueue({"type": "worker-b"}, priority=1)
+
+        import asyncio
+        task_a = asyncio.run(
+            dequeue_now(self.scheduler, worker_id="worker-a", now=100.0),
+        )
+        task_b = asyncio.run(
+            dequeue_now(self.scheduler, worker_id="worker-b", now=100.0),
+        )
+
+        assert self.scheduler.worker_disconnected("worker-a", now=101.0) == 1
+        assert self.scheduler.complete(task_b["id"])
+
+        reclaimed = asyncio.run(
+            dequeue_now(self.scheduler, worker_id="worker-c", now=102.0),
+        )
+
+        assert reclaimed["id"] == task_a["id"]
+        assert reclaimed["type"] == "worker-a"
+        assert self.scheduler.complete(reclaimed["id"])
+
+    def test_expired_reservation_reclaimed_before_next_dequeue(self):
+        self.scheduler.enqueue({"type": "expired"}, priority=3)
+        self.scheduler.enqueue({"type": "fresh"}, priority=1)
+
+        import asyncio
+        expired = asyncio.run(
+            dequeue_now(
+                self.scheduler,
+                worker_id="worker-a",
+                now=100.0,
+                reservation_timeout=5.0,
+            ),
+        )
+        reclaimed = asyncio.run(
+            dequeue_now(self.scheduler, worker_id="worker-b", now=106.0),
+        )
+
+        assert reclaimed["id"] == expired["id"]
+        assert reclaimed["reservation_reclaims"] == 1
+        assert reclaimed["reserved_by"] == "worker-b"
+        assert (
+            self.scheduler.audit_events()[-2]["reason"]
+            == "reservation_expired"
+        )
+
+    def test_reclaimed_task_rejects_stale_completion_token(self):
+        self.scheduler.enqueue({"type": "stale-completion"})
+
+        import asyncio
+        first_claim = asyncio.run(
+            dequeue_now(self.scheduler, worker_id="worker-a", now=100.0),
+        )
+        stale_token = first_claim["reservation_token"]
+
+        assert self.scheduler.worker_disconnected("worker-a", now=101.0) == 1
+
+        second_claim = asyncio.run(
+            dequeue_now(self.scheduler, worker_id="worker-b", now=102.0),
+        )
+
+        assert second_claim["id"] == first_claim["id"]
+        assert second_claim["reservation_token"] != stale_token
+        assert not self.scheduler.complete(
+            second_claim["id"],
+            reservation_token=stale_token,
+        )
+        assert self.scheduler.complete(
+            second_claim["id"],
+            reservation_token=second_claim["reservation_token"],
+        )
+        assert (
+            self.scheduler.audit_events()[-2]["action"]
+            == "completion_rejected"
+        )
 
 # 2019-01-09T19:07:03 update
 
