@@ -1,4 +1,5 @@
 import pytest
+
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -39,6 +40,84 @@ class TestAgentRegistry:
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
+
+    def test_register_rejects_incompatible_protocol(self):
+        with pytest.raises(ValueError, match="Unsupported protocol version"):
+            self.registry.register(
+                "test-agent",
+                "worker.processor",
+                config={"protocol_version": "2.0.0"},
+            )
+
+        audit_record = self.registry.audit_log()[-1]
+        assert audit_record["event"] == "registry_protocol_rejected"
+        assert audit_record["reason"] == "unsupported_protocol_version"
+        assert audit_record["offered_version"] == "2.0.0"
+
+    def test_resolve_rejects_incompatible_protocol_upgrade(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config={"protocol_version": "1.0.0"},
+        )
+
+        assert self.registry.resolve(agent_id, "1.0.0") is not None
+        assert self.registry.resolve(agent_id, "1.1.0") is None
+
+        audit_record = self.registry.audit_log()[-1]
+        assert audit_record["event"] == "registry_protocol_rejected"
+        assert audit_record["reason"] == "incompatible_protocol_upgrade"
+        assert audit_record["agent_id"] == agent_id
+
+    def test_update_status_rejects_duplicate_lifecycle_transition(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert not self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        audit_record = self.registry.audit_log()[-1]
+        assert audit_record["event"] == "registry_protocol_rejected"
+        assert audit_record["reason"] == "invalid_lifecycle_transition"
+        assert audit_record["agent_id"] == agent_id
+
+    def test_lifecycle_change_invalidates_resolution_cache(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+
+        assert self.registry.resolve(agent_id, "1.0.0") is not None
+        assert self.registry._resolution_cache
+
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry._resolution_cache == {}
+
+    def test_protocol_upgrade_rejected_while_agent_is_running(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config={"protocol_version": "1.0.0", "private_token": "do-not-log"},
+        )
+
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert not self.registry.negotiate_protocol_upgrade(agent_id, "1.1.0")
+
+        agent = self.registry.get(agent_id)
+        audit_record = self.registry.audit_log()[-1]
+        assert agent["protocol_version"] == "1.0.0"
+        assert agent["protocol_generation"] == 1
+        assert audit_record["reason"] == "lifecycle_state_not_stable"
+        assert "private_token" not in audit_record
+
+    def test_protocol_upgrade_invalidates_resolution_cache(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+
+        assert self.registry.resolve(agent_id, "1.0.0") is not None
+        assert self.registry._resolution_cache
+
+        assert self.registry.negotiate_protocol_upgrade(agent_id, "1.1.0")
+
+        agent = self.registry.get(agent_id)
+        assert agent["protocol_version"] == "1.1.0"
+        assert agent["protocol_generation"] == 2
+        assert self.registry._resolution_cache == {}
 
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")

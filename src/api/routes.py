@@ -1,7 +1,7 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
 
@@ -22,11 +22,21 @@ async def register_agent(name: str, agent_type: str, config: Optional[Dict] = No
 
 
 @router.get("/agents/{agent_id}")
-async def get_agent(agent_id: str):
-    agent = registry.get(agent_id)
+async def get_agent(agent_id: str, protocol_version: str = "1.0.0"):
+    agent = registry.resolve(agent_id, protocol_version)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
+
+
+@router.post("/agents/{agent_id}/protocol")
+async def negotiate_agent_protocol(agent_id: str, protocol_version: str):
+    if not registry.negotiate_protocol_upgrade(agent_id, protocol_version):
+        raise HTTPException(
+            status_code=409,
+            detail="Protocol negotiation rejected or deferred",
+        )
+    return {"status": "protocol_updated"}
 
 
 @router.delete("/agents/{agent_id}")
