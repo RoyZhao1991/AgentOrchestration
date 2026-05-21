@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,51 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+        retried_task = asyncio.run(self.scheduler.dequeue())
+        assert retried_task["id"] == task["id"]
+        assert retried_task["retries"] == 1
+
+    def test_acknowledgement_retry_writes_dead_letter_once(self):
+        task_id = self.scheduler.enqueue({
+            "type": "billing",
+            "payload": {"secret": "token"},
+        })
+
+        for _ in range(3):
+            task = asyncio.run(self.scheduler.dequeue())
+            assert task["id"] == task_id
+            assert self.scheduler.fail(task_id, reason="worker_error")
+
+        assert self.scheduler.fail(task_id, reason="worker_error")
+
+        dead_letters = self.scheduler.dead_letters()
+        assert len(dead_letters) == 1
+        assert dead_letters[0]["task_id"] == task_id
+        assert dead_letters[0]["type"] == "billing"
+        assert dead_letters[0]["retries"] == 3
+        assert "payload" not in dead_letters[0]
+
+        audit_records = self.scheduler.audit_records()
+        assert audit_records[-2]["event"] == "dead_letter_written"
+        assert audit_records[-1] == {
+            "event": "dead_letter_duplicate",
+            "task_ref": dead_letters[0]["task_ref"],
+            "reason": "duplicate_acknowledgement_retry",
+        }
+        assert all("token" not in str(record) for record in audit_records)
 
 # 2019-01-09T19:07:03 update
 

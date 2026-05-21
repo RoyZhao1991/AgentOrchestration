@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import hashlib
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -35,26 +35,47 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._dead_letters: Dict[str, Dict[str, Any]] = {}
+        self._audit_records: List[Dict[str, str]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["priority"] = priority
 
+        self._push_task(task, queue, priority)
+        return task_id
+
+    def _push_task(self, task: Dict, queue: str, priority: int = 0) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -72,14 +93,79 @@ class TaskScheduler:
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        reason: str = "handler_failed",
+    ) -> bool:
         task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+        if task is None:
+            if task_id in self._dead_letters:
+                self._audit(
+                    "dead_letter_duplicate",
+                    task_id,
+                    "duplicate_acknowledgement_retry",
+                )
                 return True
-        return False
+            self._audit(
+                "dead_letter_rejected",
+                task_id,
+                "missing_in_flight_task",
+            )
+            return False
+
+        task["retries"] = int(task.get("retries", 0)) + 1
+        if task["retries"] < self._max_retries:
+            task["enqueued_at"] = time.time()
+            self._push_task(task, queue, priority=task.get("priority", 0))
+            self._audit(
+                "retry_enqueued",
+                task_id,
+                f"retry_{task['retries']}",
+            )
+            return True
+
+        return self._write_dead_letter(task, reason)
+
+    def dead_letters(self) -> List[Dict[str, Any]]:
+        return list(self._dead_letters.values())
+
+    def audit_records(self) -> List[Dict[str, str]]:
+        return list(self._audit_records)
+
+    def _write_dead_letter(self, task: Dict, reason: str) -> bool:
+        task_id = task["id"]
+        if task_id in self._dead_letters:
+            self._audit(
+                "dead_letter_duplicate",
+                task_id,
+                "duplicate_acknowledgement_retry",
+            )
+            return True
+
+        self._dead_letters[task_id] = {
+            "task_id": task_id,
+            "task_ref": self._task_ref(task_id),
+            "type": str(task.get("type", "")),
+            "retries": task.get("retries", 0),
+            "reason": reason,
+            "failed_at": time.time(),
+        }
+        self._audit("dead_letter_written", task_id, reason)
+        return True
+
+    def _audit(self, event: str, task_id: str, reason: str) -> None:
+        self._audit_records.append({
+            "event": event,
+            "task_ref": self._task_ref(task_id),
+            "reason": reason,
+        })
+
+    @staticmethod
+    def _task_ref(task_id: str) -> str:
+        digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+        return digest[:12]
 
 # 2019-04-25T08:37:12 update
 
