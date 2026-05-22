@@ -1,8 +1,13 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
+import re
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+TEMPLATE_PATTERN = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*}}")
 
 
 class StepStatus(Enum):
@@ -13,13 +18,32 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class TemplateBindingError(ValueError):
+    def __init__(self, step: "WorkflowStep", variables: List[str]):
+        self.step = step
+        self.variables = tuple(sorted(set(variables)))
+        super().__init__(
+            "Unresolved template variables: "
+            + ", ".join(self.variables)
+        )
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        parameters: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.parameters = parameters or {}
+        self.bound_parameters: Dict[str, Any] = {}
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -46,6 +70,7 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self.audit_records: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -61,16 +86,31 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
-    def execute_workflow(self, workflow_id: str) -> bool:
+    def execute_workflow(
+        self,
+        workflow_id: str,
+        runtime_parameters: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
+            return False
+
+        runtime_parameters = runtime_parameters or {}
+        try:
+            bound_parameters = self._prepare_workflow_parameters(
+                workflow,
+                runtime_parameters,
+            )
+        except TemplateBindingError as e:
+            self._record_template_rejection(workflow, e)
             return False
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
+            step.bound_parameters = bound_parameters[step.id]
             try:
-                result = step.handler()
+                result = step.handler(**step.bound_parameters)
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
@@ -81,6 +121,97 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _prepare_workflow_parameters(
+        self,
+        workflow: Workflow,
+        runtime_parameters: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        bound_parameters = {}
+        for step in workflow.steps:
+            unresolved: List[str] = []
+            bound = self._bind_value(
+                step.parameters,
+                runtime_parameters,
+                unresolved,
+            )
+            if unresolved:
+                raise TemplateBindingError(step, unresolved)
+            bound_parameters[step.id] = bound
+        return bound_parameters
+
+    def _bind_value(
+        self,
+        value: Any,
+        runtime_parameters: Dict[str, Any],
+        unresolved: List[str],
+    ) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: self._bind_value(item, runtime_parameters, unresolved)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                self._bind_value(item, runtime_parameters, unresolved)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                self._bind_value(item, runtime_parameters, unresolved)
+                for item in value
+            )
+        if not isinstance(value, str):
+            return value
+
+        matches = list(TEMPLATE_PATTERN.finditer(value))
+        if not matches:
+            return value
+
+        if len(matches) == 1 and matches[0].span() == (0, len(value)):
+            variable = matches[0].group(1)
+            if variable not in runtime_parameters:
+                unresolved.append(variable)
+                return value
+            replacement = runtime_parameters[variable]
+            if isinstance(replacement, str):
+                for match in TEMPLATE_PATTERN.finditer(replacement):
+                    unresolved.append(match.group(1))
+            return replacement
+
+        rendered = value
+        for match in matches:
+            variable = match.group(1)
+            if variable not in runtime_parameters:
+                unresolved.append(variable)
+                continue
+            rendered = rendered.replace(
+                match.group(0),
+                str(runtime_parameters[variable]),
+            )
+
+        for match in TEMPLATE_PATTERN.finditer(rendered):
+            unresolved.append(match.group(1))
+        return rendered
+
+    def _record_template_rejection(
+        self,
+        workflow: Workflow,
+        error: TemplateBindingError,
+    ) -> None:
+        record = {
+            "event": "workflow_template_binding_rejected",
+            "workflow_id": workflow.id,
+            "step_id": error.step.id,
+            "step_name": error.step.name,
+            "unresolved_variables": list(error.variables),
+        }
+        self.audit_records.append(record)
+        logger.warning(
+            "Rejected workflow template binding for workflow %s step %s",
+            workflow.id,
+            error.step.id,
+        )
 
 # 2019-03-27T19:58:07 update
 
