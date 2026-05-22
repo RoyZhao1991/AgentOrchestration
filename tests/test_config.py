@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,17 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_to_dict_returns_deep_copy(self):
+        config = Config()
+        config.set("runtime.limits", {"cpu": 2, "tags": ["safe"]})
+
+        data = config.to_dict()
+        data["runtime"]["limits"]["cpu"] = 99
+        data["runtime"]["limits"]["tags"].append("mutated")
+
+        assert config.get("runtime.limits.cpu") == 2
+        assert config.get("runtime.limits.tags") == ["safe"]
 
 # 2019-02-01T18:58:35 update
 
