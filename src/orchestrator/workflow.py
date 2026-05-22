@@ -1,7 +1,9 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+import inspect
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 
@@ -14,10 +16,18 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        condition: Optional[Callable] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
+        self.condition = condition
         self.retries = retries
         self.timeout = timeout
         self.status = StepStatus.PENDING
@@ -44,8 +54,10 @@ class Workflow:
 
 
 class WorkflowManager:
-    def __init__(self):
+    def __init__(self, audit_limit: int = 100):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_limit = audit_limit
+        self._audit_log: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -68,19 +80,220 @@ class WorkflowManager:
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
-            step.status = StepStatus.RUNNING
+            if not self._pre_dispatch_condition_allows(workflow, step):
+                if step.status == StepStatus.SKIPPED:
+                    continue
+                workflow.status = StepStatus.FAILED
+                return False
+
             try:
+                step.status = StepStatus.RUNNING
+                self._record_audit(
+                    workflow,
+                    step,
+                    "transition",
+                    "step_running",
+                )
                 result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
+                self._record_audit(
+                    workflow,
+                    step,
+                    "transition",
+                    "step_completed",
+                )
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
                 workflow.status = StepStatus.FAILED
+                self._record_audit(
+                    workflow,
+                    step,
+                    "transition",
+                    "handler_failed",
+                )
                 return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def audit_log(self) -> List[Dict[str, Any]]:
+        return [dict(entry) for entry in self._audit_log]
+
+    def _pre_dispatch_condition_allows(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+    ) -> bool:
+        if step.condition is None:
+            return True
+
+        snapshot = self._condition_snapshot(workflow)
+        try:
+            condition_result = self._call_condition(
+                step.condition,
+                workflow,
+                step,
+            )
+        except Exception as e:
+            self._restore_condition_snapshot(workflow, snapshot)
+            step.error = str(e)
+            step.status = StepStatus.FAILED
+            self._record_audit(workflow, step, "reject", "condition_failed")
+            return False
+
+        if not isinstance(condition_result, bool):
+            self._restore_condition_snapshot(workflow, snapshot)
+            step.error = "condition returned non-boolean result"
+            step.status = StepStatus.FAILED
+            self._record_audit(
+                workflow,
+                step,
+                "reject",
+                "condition_non_boolean",
+            )
+            return False
+
+        if self._condition_fingerprint(workflow) != snapshot["fingerprint"]:
+            self._restore_condition_snapshot(workflow, snapshot)
+            step.error = "condition attempted lifecycle side effects"
+            step.status = StepStatus.FAILED
+            self._record_audit(
+                workflow,
+                step,
+                "reject",
+                "condition_side_effect",
+            )
+            return False
+
+        if not condition_result:
+            step.status = StepStatus.SKIPPED
+            self._record_audit(workflow, step, "transition", "condition_false")
+            return False
+
+        self._record_audit(workflow, step, "allow", "condition_true")
+        return True
+
+    def _call_condition(
+        self,
+        condition: Callable,
+        workflow: Workflow,
+        step: WorkflowStep,
+    ) -> Any:
+        try:
+            parameter_count = len(inspect.signature(condition).parameters)
+        except (TypeError, ValueError):
+            parameter_count = 0
+
+        if parameter_count >= 2:
+            return condition(workflow, step)
+        if parameter_count == 1:
+            return condition(workflow)
+        return condition()
+
+    def _condition_snapshot(
+        self,
+        workflow: Workflow,
+    ) -> Dict[str, Any]:
+        step_values = [
+            (
+                step,
+                step.name,
+                step.handler,
+                step.condition,
+                step.retries,
+                step.timeout,
+                step.status,
+                step.result,
+                step.error,
+            )
+            for step in workflow.steps
+        ]
+        return {
+            "workflow_status": workflow.status,
+            "steps": list(workflow.steps),
+            "step_map": dict(workflow._step_map),
+            "step_values": step_values,
+            "fingerprint": self._condition_fingerprint(workflow),
+        }
+
+    def _restore_condition_snapshot(
+        self,
+        workflow: Workflow,
+        snapshot: Dict[str, Any],
+    ) -> None:
+        workflow.status = snapshot["workflow_status"]
+        workflow.steps = list(snapshot["steps"])
+        workflow._step_map = dict(snapshot["step_map"])
+        for (
+            step,
+            name,
+            handler,
+            condition,
+            retries,
+            timeout,
+            status,
+            result,
+            error,
+        ) in snapshot["step_values"]:
+            step.name = name
+            step.handler = handler
+            step.condition = condition
+            step.retries = retries
+            step.timeout = timeout
+            step.status = status
+            step.result = result
+            step.error = error
+
+    def _condition_fingerprint(
+        self,
+        workflow: Workflow,
+    ) -> Tuple[Any, ...]:
+        return (
+            workflow.status,
+            tuple(step.id for step in workflow.steps),
+            tuple(
+                sorted(
+                    (step_id, id(step))
+                    for step_id, step in workflow._step_map.items()
+                )
+            ),
+            tuple(
+                (
+                    id(step),
+                    step.id,
+                    step.name,
+                    id(step.handler),
+                    id(step.condition),
+                    step.retries,
+                    step.timeout,
+                    step.status,
+                    step.result,
+                    step.error,
+                )
+                for step in workflow.steps
+            ),
+        )
+
+    def _record_audit(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+        action: str,
+        reason: str,
+    ) -> None:
+        self._audit_log.append({
+            "timestamp": time.time(),
+            "action": action,
+            "reason": reason,
+            "workflow_id": workflow.id,
+            "workflow_status": workflow.status.value,
+            "step_id": step.id,
+            "step_status": step.status.value,
+        })
+        if len(self._audit_log) > self._audit_limit:
+            self._audit_log = self._audit_log[-self._audit_limit:]
 
 # 2019-03-27T19:58:07 update
 
