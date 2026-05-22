@@ -1,5 +1,9 @@
 """Common utilities and shared components."""
 
+from .download_cache import ArtifactDownloadCache, DigestMismatchError
+
+__all__ = ["ArtifactDownloadCache", "DigestMismatchError"]
+
 # 2019-02-08T08:43:22 update
 
 # 2019-02-15T15:32:20 update

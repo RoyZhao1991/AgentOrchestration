@@ -2,7 +2,7 @@
 
 import functools
 import asyncio
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Optional
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
@@ -23,7 +23,10 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
                 )
                 return result
             except asyncio.TimeoutError:
-                raise TimeoutError(f"Task {name or func.__name__} timed out after {timeout}s")
+                raise TimeoutError(
+                    f"Task {name or func.__name__} timed out "
+                    f"after {timeout}s"
+                )
 
         return wrapper
     return decorator
