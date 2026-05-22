@@ -2,14 +2,17 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional
-from urllib.request import Request, urlopen
+from typing import Dict
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 
 class OrchestratorClient:
     def __init__(self, base_url: str = None, api_key: str = None):
-        self.base_url = base_url or os.getenv("AO_API_URL", "https://api.agent-orchestrator.io")
+        self.base_url = base_url or os.getenv(
+            "AO_API_URL",
+            "https://api.agent-orchestrator.io",
+        )
         self.api_key = api_key or os.getenv("AO_API_KEY", "")
         self._session = None
 
@@ -28,9 +31,17 @@ class OrchestratorClient:
         except HTTPError as e:
             return {"error": e.code, "message": e.reason}
 
-    def register_agent(self, name: str, agent_type: str, config: Dict = None) -> Dict:
+    def register_agent(
+        self,
+        name: str,
+        agent_type: str,
+        config: Dict = None,
+    ) -> Dict:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Agent name must be a non-empty string")
+        normalized_name = name.strip()
         return self._request("POST", "/agents", {
-            "name": name,
+            "name": normalized_name,
             "agent_type": agent_type,
             "config": config or {},
         })
