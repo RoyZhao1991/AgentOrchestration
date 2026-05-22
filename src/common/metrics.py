@@ -15,6 +15,8 @@ class MetricsCollector:
         self._timers: Dict[str, float] = {}
 
     def increment(self, metric: str, value: int = 1) -> None:
+        if value < 0:
+            raise ValueError("Counter increments must be non-negative")
         with self._lock:
             self._counters[metric] += value
 
@@ -32,19 +34,26 @@ class MetricsCollector:
 
     def stop_timer(self, metric: str) -> float:
         with self._lock:
-            if metric in self._timers:
-                duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
-                return duration
-        return 0.0
+            start_time = self._timers.pop(metric, None)
+        if start_time is None:
+            return 0.0
+        duration = time.time() - start_time
+        self.observe(metric, duration)
+        return duration
 
     def snapshot(self) -> Dict:
         with self._lock:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
 
 
