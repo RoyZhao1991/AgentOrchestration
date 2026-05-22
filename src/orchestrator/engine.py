@@ -12,12 +12,31 @@ logger = logging.getLogger(__name__)
 
 
 class OrchestrationEngine:
+    _ALLOWED_LIFECYCLE_TRANSITIONS = {
+        None: {"pending", "queued", "running"},
+        "pending": {"queued", "running", "failed", "cancelled"},
+        "queued": {"running", "failed", "cancelled"},
+        "running": {"paused", "completed", "failed", "stopped", "cancelled"},
+        "paused": {"running", "stopped", "cancelled"},
+        "completed": set(),
+        "failed": set(),
+        "stopped": set(),
+        "terminated": set(),
+        "cancelled": set(),
+    }
+
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
+        self._event_states: Dict[str, Dict[str, Any]] = {}
+        self._event_audit: List[Dict[str, Any]] = []
+        self._event_metrics: Dict[str, int] = {
+            "event_intake.accepted": 0,
+            "event_intake.rejected": 0,
+        }
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -28,6 +47,139 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def ingest_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate shared event-bus events before committing state."""
+        run_id = event.get("run_id")
+        tenant_id = event.get("tenant_id")
+        lifecycle = event.get("lifecycle") or event.get("status")
+
+        if not run_id:
+            return self._reject_event(None, None, "missing_run_id")
+        if not tenant_id:
+            return self._reject_event(run_id, None, "missing_tenant")
+        if not lifecycle:
+            return self._reject_event(run_id, None, "missing_lifecycle")
+
+        lifecycle = str(lifecycle).lower()
+        attempt = self._coerce_non_negative_int(event.get("attempt", 0))
+        revision = self._coerce_non_negative_int(event.get("revision", 0))
+        if attempt is None:
+            return self._reject_event(run_id, None, "invalid_attempt")
+        if revision is None:
+            return self._reject_event(run_id, None, "invalid_revision")
+
+        current = self._event_states.get(run_id)
+        if current and current["tenant_id"] != tenant_id:
+            return self._reject_event(run_id, current, "tenant_mismatch")
+
+        if current:
+            current_attempt = current["attempt"]
+            current_revision = current["revision"]
+            if attempt < current_attempt:
+                return self._reject_event(run_id, current, "stale_attempt")
+            if attempt == current_attempt and revision <= current_revision:
+                return self._reject_event(run_id, current, "stale_revision")
+            if not self._can_transition(current["lifecycle"], lifecycle):
+                return self._reject_event(
+                    run_id,
+                    current,
+                    "invalid_lifecycle_transition",
+                )
+        elif not self._can_transition(None, lifecycle):
+            return self._reject_event(
+                run_id,
+                None,
+                "invalid_initial_lifecycle",
+            )
+
+        state = {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "agent_id": event.get("agent_id"),
+            "lifecycle": lifecycle,
+            "attempt": attempt,
+            "revision": revision,
+        }
+        self._event_states[run_id] = state
+        self._record_event_decision(run_id, "accepted", lifecycle)
+        logger.info("Accepted orchestrator event run_id=%s", run_id)
+        return {
+            "accepted": True,
+            "reason": "accepted",
+            "run_id": run_id,
+            "lifecycle": lifecycle,
+        }
+
+    def event_state(self, run_id: str) -> Optional[Dict[str, Any]]:
+        state = self._event_states.get(run_id)
+        return dict(state) if state else None
+
+    @property
+    def event_audit(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._event_audit]
+
+    @property
+    def event_metrics(self) -> Dict[str, int]:
+        return dict(self._event_metrics)
+
+    def _reject_event(
+        self,
+        run_id: Optional[str],
+        current: Optional[Dict[str, Any]],
+        reason: str,
+    ) -> Dict[str, Any]:
+        lifecycle = current["lifecycle"] if current else None
+        self._record_event_decision(run_id, reason, lifecycle)
+        logger.warning(
+            "Rejected orchestrator event run_id=%s reason=%s",
+            run_id,
+            reason,
+        )
+        return {
+            "accepted": False,
+            "reason": reason,
+            "run_id": run_id,
+            "current_lifecycle": lifecycle,
+        }
+
+    def _record_event_decision(
+        self,
+        run_id: Optional[str],
+        reason: str,
+        lifecycle: Optional[str],
+    ) -> None:
+        metric = (
+            "event_intake.accepted"
+            if reason == "accepted"
+            else "event_intake.rejected"
+        )
+        self._event_metrics[metric] += 1
+        if reason != "accepted":
+            key = f"event_intake.rejected.{reason}"
+            self._event_metrics[key] = self._event_metrics.get(key, 0) + 1
+        self._event_audit.append(
+            {
+                "run_id": run_id,
+                "decision": reason,
+                "lifecycle": lifecycle,
+            }
+        )
+
+    def _can_transition(
+        self,
+        current: Optional[str],
+        lifecycle: str,
+    ) -> bool:
+        allowed = self._ALLOWED_LIFECYCLE_TRANSITIONS.get(current, set())
+        return lifecycle == current or lifecycle in allowed
+
+    def _coerce_non_negative_int(self, value: Any) -> Optional[int]:
+        try:
+            coerced = int(value)
+        except (TypeError, ValueError):
+            return None
+        return coerced if coerced >= 0 else None
 
     async def start(self) -> None:
         self._running = True
@@ -82,7 +234,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
