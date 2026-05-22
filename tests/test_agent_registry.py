@@ -1,4 +1,5 @@
 import pytest
+
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -47,6 +48,81 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_register_rejects_invalid_route_weight_total(self):
+        with pytest.raises(ValueError, match="route weights must total 100"):
+            self.registry.register(
+                "canary-router",
+                "worker.router",
+                {
+                    "routing_policy": {
+                        "strategy": "traffic_split",
+                        "routes": [
+                            {"type": "worker.blue", "weight": 60},
+                            {"type": "worker.green", "weight": 20},
+                        ],
+                    },
+                },
+            )
+
+        assert self.registry.count() == 0
+        audit_record = self.registry.audit_records()[-1]
+        assert audit_record["decision"] == "rejected"
+        assert audit_record["reason"] == "route_weight_total_mismatch"
+        assert audit_record["details"] == {
+            "weight_total": "80",
+            "route_count": 2,
+        }
+
+    def test_resolve_rejects_duplicate_route_targets(self):
+        agent_id = self.registry.register("blue", "worker.blue")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        with pytest.raises(ValueError, match="duplicate route target"):
+            self.registry.resolve(
+                "worker.router",
+                {
+                    "routes": [
+                        {"type": "worker.blue", "weight": 50},
+                        {"type": "worker.blue", "weight": 50},
+                    ],
+                },
+            )
+
+        assert self.registry.get(agent_id)["status"] == "running"
+        audit_record = self.registry.audit_records()[-1]
+        assert audit_record["decision"] == "rejected"
+        assert audit_record["reason"] == "duplicate_route_target"
+
+    def test_resolve_invalidates_cache_when_route_target_changes_status(self):
+        blue_id = self.registry.register("blue", "worker.blue")
+        green_id = self.registry.register("green", "worker.green")
+        self.registry.update_status(blue_id, AgentStatus.RUNNING)
+        self.registry.update_status(green_id, AgentStatus.RUNNING)
+        route_policy = {
+            "traffic_split": {
+                "worker.blue": 40,
+                "worker.green": 60,
+            },
+        }
+
+        resolved = self.registry.resolve("worker.router", route_policy)
+        assert {agent["type"] for agent in resolved} == {
+            "worker.blue",
+            "worker.green",
+        }
+        assert {agent["route_weight"] for agent in resolved} == {40, 60}
+
+        self.registry.update_status(green_id, AgentStatus.PAUSED)
+
+        with pytest.raises(ValueError, match="no running agents available"):
+            self.registry.resolve("worker.router", route_policy)
+
+        assert self.registry.get(blue_id)["status"] == "running"
+        assert self.registry.get(green_id)["status"] == "paused"
+        audit_record = self.registry.audit_records()[-1]
+        assert audit_record["decision"] == "deferred"
+        assert audit_record["reason"] == "no_running_agents_for_route"
 
 # 2019-01-23T10:28:57 update
 
