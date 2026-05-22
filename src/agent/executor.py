@@ -1,6 +1,7 @@
 """Agent Executor — Handles task execution within agent sandboxes."""
 
 import asyncio
+import json
 import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
@@ -12,8 +13,14 @@ class AgentExecutor:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self._terminal_executions: set[str] = set()
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -22,18 +29,25 @@ class AgentExecutor:
             self._active_tasks[execution_id] = task_obj
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                self._record_terminal_result(execution_id, result)
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                failure = self._failure_result(e)
+                self._record_terminal_result(execution_id, failure)
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
-        return {
+        payload = {
             "execution_id": exec_id,
             "agent_id": agent_id,
             "task_id": task.get("id"),
@@ -41,9 +55,33 @@ class AgentExecutor:
             "duration": duration,
             "timestamp": time.time(),
         }
+        self._validate_json_serializable(payload)
+        return payload
 
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
+
+    def _record_terminal_result(self, execution_id: str, result: Any) -> bool:
+        if execution_id in self._terminal_executions:
+            return False
+
+        self._results[execution_id] = result
+        self._terminal_executions.add(execution_id)
+        return True
+
+    def _failure_result(self, error: Exception) -> Dict[str, Any]:
+        return {
+            "error": str(error),
+            "timestamp": time.time(),
+        }
+
+    def _validate_json_serializable(self, payload: Any) -> None:
+        try:
+            json.dumps(payload, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Tool result is not JSON serializable: {error}",
+            ) from error
 
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
@@ -56,7 +94,10 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
