@@ -1,8 +1,13 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -14,12 +19,22 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        input_schema: Optional[Dict[str, Any]] = None,
+        sensitive_inputs: Optional[Iterable[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.input_schema = input_schema or {}
+        self.sensitive_inputs = set(sensitive_inputs or [])
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,14 +48,107 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_events: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        validation_error = self._validate_step_wiring(step)
+        if validation_error:
+            self._record_wiring_rejection(step, validation_error)
+            raise ValueError(validation_error)
+
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def _validate_step_wiring(self, step: WorkflowStep) -> Optional[str]:
+        if self.status != StepStatus.PENDING:
+            return "workflow steps can only be wired before execution starts"
+
+        schema_keys = set(step.input_schema.keys())
+        undeclared_inputs = step.sensitive_inputs - schema_keys
+        if undeclared_inputs:
+            return "sensitive inputs must be declared in the input schema"
+
+        required_inputs = _required_sensitive_inputs(step.input_schema)
+        missing_inputs = required_inputs - step.sensitive_inputs
+        if missing_inputs:
+            return "sensitive inputs require explicit declaration"
+
+        return None
+
+    def _record_wiring_rejection(
+        self,
+        step: WorkflowStep,
+        reason: str,
+    ) -> None:
+        event = {
+            "event": "workflow_step_wiring_rejected",
+            "decision": "rejected",
+            "workflow_id": self.id,
+            "workflow_status": self.status.value,
+            "step_id": step.id,
+            "step_name": step.name,
+            "reason": reason,
+            "input_count": len(step.input_schema),
+            "sensitive_input_count": len(step.sensitive_inputs),
+        }
+        self.audit_events.append(event)
+        metrics.increment("workflow.step_wiring.rejected")
+        logger.warning(
+            "Rejected workflow step wiring",
+            extra={
+                "workflow_id": self.id,
+                "workflow_status": self.status.value,
+                "step_name": step.name,
+                "reason": reason,
+                "input_count": len(step.input_schema),
+                "sensitive_input_count": len(step.sensitive_inputs),
+            },
+        )
+
+
+SENSITIVE_NAME_HINTS = (
+    "api_key",
+    "auth",
+    "credential",
+    "key",
+    "password",
+    "private",
+    "secret",
+    "token",
+)
+
+SENSITIVE_CLASSIFICATIONS = {"credential", "private", "secret", "sensitive"}
+
+
+def _required_sensitive_inputs(input_schema: Dict[str, Any]) -> Set[str]:
+    required: Set[str] = set()
+    for input_name, spec in input_schema.items():
+        if _looks_sensitive(input_name, spec):
+            required.add(input_name)
+    return required
+
+
+def _looks_sensitive(input_name: str, spec: Any) -> bool:
+    normalized_name = input_name.strip().lower()
+    if any(hint in normalized_name for hint in SENSITIVE_NAME_HINTS):
+        return True
+
+    if not isinstance(spec, dict):
+        return False
+
+    if spec.get("sensitive") is True or spec.get("secret") is True:
+        return True
+
+    classification = str(spec.get("classification", "")).strip().lower()
+    if classification in SENSITIVE_CLASSIFICATIONS:
+        return True
+
+    purpose = str(spec.get("purpose", "")).strip().lower()
+    return any(hint in purpose for hint in SENSITIVE_NAME_HINTS)
 
 
 class WorkflowManager:
