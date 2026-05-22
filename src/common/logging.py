@@ -4,7 +4,7 @@ import json
 import logging
 import sys
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict
 
 
 class StructuredFormatter(logging.Formatter):
@@ -27,8 +27,15 @@ def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
     if json_output:
         handler.setFormatter(StructuredFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), handlers=[handler])
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+            )
+        )
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        handlers=[handler],
+    )
 
 # 2019-01-14T10:37:21 update
 

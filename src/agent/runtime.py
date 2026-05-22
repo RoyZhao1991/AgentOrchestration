@@ -23,8 +23,16 @@ class AgentRuntime:
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
-        if agent_id in self._processes and self._processes[agent_id].poll() is None:
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Dict] = None,
+    ) -> bool:
+        if (
+            agent_id in self._processes
+            and self._processes[agent_id].poll() is None
+        ):
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
