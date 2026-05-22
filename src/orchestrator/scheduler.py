@@ -3,7 +3,9 @@
 import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from collections import defaultdict
+from threading import RLock
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 
@@ -21,6 +23,23 @@ class PriorityQueue:
             return heapq.heappop(self._queue)[2]
         return None
 
+    def pop_matching(self, predicate: Callable[[Any], bool]) -> Optional[Any]:
+        skipped: List[Tuple[int, int, Any]] = []
+        matched = None
+
+        while self._queue:
+            entry = heapq.heappop(self._queue)
+            item = entry[2]
+            if predicate(item):
+                matched = item
+                break
+            skipped.append(entry)
+
+        for entry in skipped:
+            heapq.heappush(self._queue, entry)
+
+        return matched
+
     def peek(self) -> Optional[Any]:
         if self._queue:
             return self._queue[0][2]
@@ -31,55 +50,379 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    _ACTIVE_STATES = {"queued", "scheduled", "in_flight"}
+    _DEFAULT_PRIORITY_BUDGETS = {
+        "urgent": 1,
+        "high": 4,
+        "default": 16,
+        "low": 8,
+    }
+
+    def __init__(
+        self,
+        priority_budgets: Optional[Dict[str, int]] = None,
+        audit_limit: int = 100,
+    ):
+        self._lock = RLock()
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._task_states: Dict[str, str] = {}
+        self._task_priority_classes: Dict[str, str] = {}
+        self._in_flight_by_priority: Dict[str, int] = defaultdict(int)
+        self._priority_budgets = dict(self._DEFAULT_PRIORITY_BUDGETS)
+        if priority_budgets:
+            self._priority_budgets.update(priority_budgets)
+        self._audit_limit = audit_limit
+        self._audit_log: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            requested_id = task.get("id")
+            current_state = self._task_states.get(requested_id)
+            if requested_id and current_state in self._ACTIVE_STATES:
+                self._record_audit(
+                    "reject",
+                    requested_id,
+                    current_state,
+                    current_state,
+                    "duplicate_active_task",
+                    queue,
+                    self._priority_class_for(task, priority),
+                )
+                raise ValueError(f"task {requested_id} is already active")
+
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["enqueued_at"] = time.time()
+            task["retries"] = 0
+            return self._queue_task(task, queue, priority, "enqueue")
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            requested_id = task.get("id")
+            current_state = self._task_states.get(requested_id)
+            if requested_id and current_state in self._ACTIVE_STATES:
+                self._record_audit(
+                    "reject",
+                    requested_id,
+                    current_state,
+                    current_state,
+                    "duplicate_active_task",
+                    queue,
+                    self._priority_class_for(task, priority),
+                )
+                raise ValueError(f"task {requested_id} is already active")
+
+            task_id = str(uuid4())
+            priority_class = self._priority_class_for(task, priority)
+            task["id"] = task_id
+            task["priority"] = priority
+            task["priority_class"] = priority_class
+            task["retries"] = task.get("retries", 0)
+            self._scheduled[task_id] = {
+                "task": task,
+                "ready_at": time.time() + delay,
+                "queue": queue,
+                "priority": priority,
+            }
+            self._task_states[task_id] = "scheduled"
+            self._task_priority_classes[task_id] = priority_class
+            self._record_audit(
+                "transition",
+                task_id,
+                None,
+                "scheduled",
+                "schedule",
+                queue,
+                priority_class,
+            )
+            return task_id
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        deadline = time.time() + timeout
+
+        while True:
+            with self._lock:
+                self._release_due_scheduled(queue)
+
+                if queue in self._queues and len(self._queues[queue]) > 0:
+                    task = self._queues[queue].pop_matching(self._can_dispatch)
+                    if task:
+                        task_id = task["id"]
+                        priority_class = self._task_priority_classes[task_id]
+                        transitioned = self._transition_task(
+                            task_id,
+                            "queued",
+                            "in_flight",
+                            "dequeue",
+                            queue,
+                        )
+                        if transitioned:
+                            self._in_flight[task_id] = task
+                            self._in_flight_by_priority[priority_class] += 1
+                            return task
+
+                if time.time() >= deadline:
+                    return None
+            await asyncio.sleep(0.01)
+        return None
+
+    def complete(self, task_id: str) -> bool:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if task:
+                transitioned = self._transition_task(
+                    task_id,
+                    "in_flight",
+                    "completed",
+                    "complete",
+                    None,
+                )
+                if transitioned:
+                    self._release_priority_budget(task_id)
+                    return True
+
+            self._record_audit(
+                "reject",
+                task_id,
+                self._task_states.get(task_id),
+                "completed",
+                "stale_complete",
+                None,
+                self._task_priority_classes.get(task_id),
+            )
+            return False
+
+    def fail(self, task_id: str, queue: str = "default") -> bool:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if not task:
+                self._record_audit(
+                    "reject",
+                    task_id,
+                    self._task_states.get(task_id),
+                    "failed",
+                    "stale_fail",
+                    queue,
+                    self._task_priority_classes.get(task_id),
+                )
+                return False
+
+            task["retries"] += 1
+            self._release_priority_budget(task_id)
+            if task["retries"] < self._max_retries:
+                self._queue_task(task, queue, task.get("priority", 0), "retry")
+                return True
+
+            return self._transition_task(
+                task_id,
+                "in_flight",
+                "failed",
+                "max_retries",
+                queue,
+            )
+
+    def task_state(self, task_id: str) -> Optional[str]:
+        with self._lock:
+            return self._task_states.get(task_id)
+
+    def audit_log(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(entry) for entry in self._audit_log]
+
+    def in_flight_count(self, priority_class: str) -> int:
+        with self._lock:
+            return self._in_flight_by_priority[priority_class]
+
+    def _queue_task(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+        reason: str,
+    ) -> str:
+        task_id = task["id"]
+        priority_class = self._priority_class_for(task, priority)
+        task["priority"] = priority
+        task["priority_class"] = priority_class
+
+        current_state = self._task_states.get(task_id)
+        if current_state not in (None, "scheduled", "in_flight"):
+            self._record_audit(
+                "reject",
+                task_id,
+                current_state,
+                "queued",
+                "invalid_queue_transition",
+                queue,
+                priority_class,
+            )
+            raise ValueError(
+                f"task {task_id} cannot transition from "
+                f"{current_state} to queued"
+            )
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
+        self._task_states[task_id] = "queued"
+        self._task_priority_classes[task_id] = priority_class
+        self._record_audit(
+            "transition",
+            task_id,
+            current_state,
+            "queued",
+            reason,
+            queue,
+            priority_class,
+        )
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
-
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def _release_due_scheduled(self, queue: str) -> None:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+        expired = [
+            tid for tid, scheduled in self._scheduled.items()
+            if scheduled["ready_at"] <= now and scheduled["queue"] == queue
+        ]
+        for task_id in expired:
+            scheduled = self._scheduled.pop(task_id)
+            self._queue_task(
+                scheduled["task"],
+                scheduled["queue"],
+                scheduled["priority"],
+                "schedule_due",
+            )
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+    def _can_dispatch(self, task: Dict) -> bool:
+        task_id = task["id"]
+        priority_class = self._task_priority_classes.get(
+            task_id,
+            self._priority_class_for(task, task.get("priority", 0)),
+        )
+        if self._task_states.get(task_id) != "queued":
+            self._record_audit(
+                "reject",
+                task_id,
+                self._task_states.get(task_id),
+                "in_flight",
+                "stale_dispatch",
+                None,
+                priority_class,
+            )
+            return False
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        limit = self._priority_budgets.get(priority_class)
+        if (
+            limit is not None
+            and self._in_flight_by_priority[priority_class] >= limit
+        ):
+            self._record_audit(
+                "defer",
+                task_id,
+                "queued",
+                "queued",
+                "priority_budget_exhausted",
+                None,
+                priority_class,
+            )
+            return False
+        return True
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+    def _transition_task(
+        self,
+        task_id: str,
+        expected_state: str,
+        next_state: str,
+        reason: str,
+        queue: Optional[str],
+    ) -> bool:
+        current_state = self._task_states.get(task_id)
+        priority_class = self._task_priority_classes.get(task_id)
+        if current_state != expected_state:
+            self._record_audit(
+                "reject",
+                task_id,
+                current_state,
+                next_state,
+                reason,
+                queue,
+                priority_class,
+            )
+            return False
+
+        self._task_states[task_id] = next_state
+        self._record_audit(
+            "transition",
+            task_id,
+            current_state,
+            next_state,
+            reason,
+            queue,
+            priority_class,
+        )
+        return True
+
+    def _release_priority_budget(self, task_id: str) -> None:
+        priority_class = self._task_priority_classes.get(task_id)
+        if priority_class and self._in_flight_by_priority[priority_class] > 0:
+            self._in_flight_by_priority[priority_class] -= 1
+
+    def _priority_class_for(self, task: Dict, priority: int) -> str:
+        explicit = (
+            task.get("priority_class")
+            or task.get("lane")
+            or task.get("workflow_lane")
+        )
+        if explicit:
+            return str(explicit).strip().lower() or "default"
+        if priority >= 100:
+            return "urgent"
+        if priority >= 10:
+            return "high"
+        if priority < 0:
+            return "low"
+        return "default"
+
+    def _record_audit(
+        self,
+        action: str,
+        task_id: Optional[str],
+        from_state: Optional[str],
+        to_state: Optional[str],
+        reason: str,
+        queue: Optional[str],
+        priority_class: Optional[str],
+    ) -> None:
+        entry = {
+            "timestamp": time.time(),
+            "action": action,
+            "task_id": task_id,
+            "from_state": from_state,
+            "to_state": to_state,
+            "reason": reason,
+            "queue": queue,
+            "priority_class": priority_class,
+        }
+        self._audit_log.append(entry)
+        if len(self._audit_log) > self._audit_limit:
+            self._audit_log = self._audit_log[-self._audit_limit:]
 
 # 2019-04-25T08:37:12 update
 

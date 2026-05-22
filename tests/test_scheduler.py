@@ -36,6 +36,64 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_urgent_lane_budget_defers_second_urgent_task(self):
+        scheduler = TaskScheduler(priority_budgets={"urgent": 1})
+
+        first_id = scheduler.enqueue({"type": "first"}, priority=100)
+        second_id = scheduler.enqueue({"type": "second"}, priority=100)
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue(timeout=0.01))
+        blocked = asyncio.run(scheduler.dequeue(timeout=0.01))
+
+        assert first["id"] == first_id
+        assert blocked is None
+        assert scheduler.task_state(second_id) == "queued"
+        assert scheduler.in_flight_count("urgent") == 1
+        assert any(
+            entry["reason"] == "priority_budget_exhausted"
+            for entry in scheduler.audit_log()
+        )
+
+        assert scheduler.complete(first_id)
+        second = asyncio.run(scheduler.dequeue(timeout=0.01))
+        assert second["id"] == second_id
+
+    def test_active_task_duplicate_rejected_before_queue_mutation(self):
+        task_id = self.scheduler.enqueue({"type": "test"}, priority=100)
+
+        with pytest.raises(ValueError):
+            self.scheduler.enqueue(
+                {"id": task_id, "type": "duplicate"},
+                priority=100,
+            )
+
+        assert self.scheduler.task_state(task_id) == "queued"
+        assert any(
+            entry["reason"] == "duplicate_active_task"
+            for entry in self.scheduler.audit_log()
+        )
+
+    def test_stale_completion_is_rejected_without_payload_audit_data(self):
+        task_id = self.scheduler.enqueue(
+            {"type": "test", "payload": {"token": "secret"}}
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert self.scheduler.complete(task_id)
+        assert not self.scheduler.complete(task_id)
+
+        stale_entries = [
+            entry for entry in self.scheduler.audit_log()
+            if entry["reason"] == "stale_complete"
+        ]
+        assert stale_entries
+        assert all("payload" not in entry for entry in stale_entries)
+        assert all("token" not in entry for entry in stale_entries)
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
