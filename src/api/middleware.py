@@ -1,18 +1,72 @@
 """API middleware components."""
 
+import contextvars
 import time
 import logging
-from typing import Callable
+from typing import Callable, Dict, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+AGENT_CONTEXT_HEADER = "X-Agent-ID"
+AGENT_CONTEXT_CLEARED_HEADER = "X-Agent-Context-Cleared"
+
+_agent_context: contextvars.ContextVar[Optional[Dict[str, str]]] = (
+    contextvars.ContextVar("agent_context", default=None)
+)
+
+
+def get_request_agent_context() -> Optional[Dict[str, str]]:
+    context = _agent_context.get()
+    return dict(context) if context else None
+
+
+def clear_request_agent_context() -> None:
+    _agent_context.set(None)
+
+
+class AgentContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        token = _agent_context.set(self._context_from_request(request))
+        status_code = "error"
+        try:
+            response = await call_next(request)
+            status_code = str(response.status_code)
+            response.headers[AGENT_CONTEXT_CLEARED_HEADER] = "true"
+            return response
+        finally:
+            _agent_context.reset(token)
+            logger.info(
+                "Cleared request-local agent context path=%s status=%s",
+                request.url.path,
+                status_code,
+            )
+
+    def _context_from_request(
+        self,
+        request: Request,
+    ) -> Optional[Dict[str, str]]:
+        agent_id = request.headers.get(AGENT_CONTEXT_HEADER, "").strip()
+        if not agent_id:
+            return None
+        return {"agent_id": agent_id}
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_protected = request.url.path.startswith("/api/v2")
+        is_token_route = request.url.path == "/api/v2/auth/token"
+        if is_protected and not is_token_route:
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +80,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +104,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
