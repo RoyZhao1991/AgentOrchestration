@@ -17,6 +17,22 @@ class TestMetricsCollector:
         snapshot = self.metrics.snapshot()
         assert snapshot["gauges"]["memory.usage"] == 85.5
 
+    def test_gauge_rejects_non_numeric_values(self):
+        self.metrics.gauge("workers.active", 3)
+
+        with pytest.raises(TypeError, match="gauge value must be numeric"):
+            self.metrics.gauge("workers.active", "three")
+
+        snapshot = self.metrics.snapshot()
+        assert snapshot["gauges"]["workers.active"] == 3.0
+
+    def test_gauge_rejects_bool_values(self):
+        with pytest.raises(TypeError, match="gauge value must be numeric"):
+            self.metrics.gauge("feature.enabled", True)
+
+        snapshot = self.metrics.snapshot()
+        assert "feature.enabled" not in snapshot["gauges"]
+
     def test_observe(self):
         self.metrics.observe("response.time", 0.5)
         self.metrics.observe("response.time", 1.5)
