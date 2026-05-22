@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config
+from src.agent.sandbox import ResourceLimits
 
 
 class TestConfig:
@@ -31,6 +32,38 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_resource_limit_config_accepts_numeric_strings(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(
+            '{"sandbox": {"resource_limits": {'
+            '"cpu_time": "30", "memory_mb": "256", "disk_mb": "64"'
+            "}}}",
+        )
+
+        limits = Config(str(config_file)).resource_limits()
+
+        assert limits.cpu_time == 30
+        assert limits.memory_mb == 256
+        assert limits.disk_mb == 64
+
+    def test_resource_limits_from_config_reject_negative_values(self):
+        config = Config()
+        config.set("sandbox.resource_limits.cpu_time", -1)
+
+        with pytest.raises(ValueError, match="cpu_time must be positive"):
+            config.resource_limits()
+
+    def test_resource_limits_from_config_reject_bool_values(self):
+        config = Config()
+        config.set("sandbox.resource_limits.memory_mb", True)
+
+        with pytest.raises(TypeError, match="memory_mb must be numeric"):
+            config.resource_limits()
+
+    def test_resource_limits_direct_constructor_rejects_zero_disk(self):
+        with pytest.raises(ValueError, match="disk_mb must be positive"):
+            ResourceLimits(disk_mb=0)
 
 # 2019-02-01T18:58:35 update
 

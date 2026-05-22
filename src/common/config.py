@@ -47,6 +47,15 @@ class Config:
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
+    def resource_limits(self, prefix: str = "sandbox.resource_limits"):
+        from src.agent.sandbox import ResourceLimits
+
+        return ResourceLimits(
+            cpu_time=self.get(f"{prefix}.cpu_time", 60),
+            memory_mb=self.get(f"{prefix}.memory_mb", 512),
+            disk_mb=self.get(f"{prefix}.disk_mb", 100),
+        )
+
     def to_dict(self) -> Dict:
         return self._data
 
