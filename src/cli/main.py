@@ -2,9 +2,30 @@
 
 import argparse
 import sys
+import time
 
 from src.common.config import Config
 from src.common.logging import configure_logging
+
+STATUS_WATCH_INTERRUPT_EXIT_CODE = 130
+
+
+def _print_status_snapshot():
+    print("Checking agent status...")
+
+
+def _run_status(watch: bool) -> int:
+    if not watch:
+        _print_status_snapshot()
+        return 0
+
+    try:
+        while True:
+            _print_status_snapshot()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStatus watch interrupted; exiting cleanly.", file=sys.stderr)
+        return STATUS_WATCH_INTERRUPT_EXIT_CODE
 
 
 def cli():
@@ -39,7 +60,9 @@ def cli():
     elif args.command == "deploy":
         print(f"Deploying agent from manifest: {args.manifest}")
     elif args.command == "status":
-        print("Checking agent status...")
+        status_code = _run_status(args.watch)
+        if status_code:
+            sys.exit(status_code)
     elif args.command == "logs":
         print(f"Fetching logs for agent: {args.agent_id}")
     else:
