@@ -2,14 +2,27 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Dict
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+
+
+class SDKRequestError(RuntimeError):
+    """SDK transport error with sanitized request context."""
+
+    def __init__(self, method: str, path: str, cause: Exception):
+        self.method = method
+        self.path = path
+        self.cause = cause
+        super().__init__(f"{method} {path} failed: {cause}")
 
 
 class OrchestratorClient:
     def __init__(self, base_url: str = None, api_key: str = None):
-        self.base_url = base_url or os.getenv("AO_API_URL", "https://api.agent-orchestrator.io")
+        self.base_url = base_url or os.getenv(
+            "AO_API_URL",
+            "https://api.agent-orchestrator.io",
+        )
         self.api_key = api_key or os.getenv("AO_API_KEY", "")
         self._session = None
 
@@ -26,9 +39,21 @@ class OrchestratorClient:
             with urlopen(req) as resp:
                 return json.loads(resp.read().decode())
         except HTTPError as e:
-            return {"error": e.code, "message": e.reason}
+            return {
+                "error": e.code,
+                "message": e.reason,
+                "method": method,
+                "path": path,
+            }
+        except (OSError, URLError) as e:
+            raise SDKRequestError(method, path, e) from e
 
-    def register_agent(self, name: str, agent_type: str, config: Dict = None) -> Dict:
+    def register_agent(
+        self,
+        name: str,
+        agent_type: str,
+        config: Dict = None,
+    ) -> Dict:
         return self._request("POST", "/agents", {
             "name": name,
             "agent_type": agent_type,
