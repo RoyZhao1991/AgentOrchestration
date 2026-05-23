@@ -1,5 +1,23 @@
 """Common utilities and shared components."""
 
+from .lineage import (
+    AnalyticsPublisher,
+    DataLineageMetadata,
+    LineageValidationError,
+    TransformedDataset,
+    build_transformed_dataset,
+    trace_metric_to_source,
+)
+
+__all__ = [
+    "AnalyticsPublisher",
+    "DataLineageMetadata",
+    "LineageValidationError",
+    "TransformedDataset",
+    "build_transformed_dataset",
+    "trace_metric_to_source",
+]
+
 # 2019-02-08T08:43:22 update
 
 # 2019-02-15T15:32:20 update
