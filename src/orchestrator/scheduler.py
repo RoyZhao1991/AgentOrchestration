@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,36 +30,78 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        clock: Optional[Callable[[], float]] = None,
+        wall_clock: Optional[Callable[[], float]] = None,
+        heartbeat_timeout: float = 30.0,
+    ):
+        self._clock = clock or time.monotonic
+        self._wall_clock = wall_clock or time.time
+        self.heartbeat_timeout = heartbeat_timeout
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._heartbeats: Dict[str, Dict] = {}
+        self._heartbeat_audit: List[Dict] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._wall_clock()
+        task["queued_at_monotonic"] = self._clock()
         task["retries"] = 0
 
+        self._push_task(task, queue, priority)
+        return task_id
+
+    def _push_task(self, task: Dict, queue: str, priority: int = 0) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
+        task["queue"] = queue
+        task["priority"] = priority
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["retries"] = 0
+        task["scheduled_at"] = self._wall_clock()
+        task["scheduled_at_monotonic"] = self._clock()
+        self._scheduled[task_id] = {
+            "task": task,
+            "ready_at": self._clock() + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._clock()
+        expired = [
+            tid
+            for tid, entry in self._scheduled.items()
+            if entry["ready_at"] <= now and entry["queue"] == queue
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            entry = self._scheduled.pop(tid)
+            self._push_task(entry["task"], entry["queue"], entry["priority"])
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -77,9 +118,102 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                task["enqueued_at"] = self._wall_clock()
+                task["queued_at_monotonic"] = self._clock()
+                self._push_task(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def record_heartbeat(
+        self,
+        worker_id: str,
+        task_id: Optional[str] = None,
+        state: str = "running",
+    ) -> Dict:
+        if not worker_id:
+            raise ValueError("worker_id is required")
+
+        now = self._clock()
+        previous = self._heartbeats.get(worker_id)
+        if previous and now < previous["monotonic_seen_at"]:
+            return self._audit_heartbeat(
+                worker_id,
+                "rejected",
+                "non_monotonic_heartbeat",
+                task_id=previous.get("task_id"),
+                state=previous.get("state"),
+            )
+
+        heartbeat = {
+            "worker_id": worker_id,
+            "task_id": task_id,
+            "state": state,
+            "monotonic_seen_at": now,
+            "wall_seen_at": self._wall_clock(),
+        }
+        self._heartbeats[worker_id] = heartbeat
+        return self._audit_heartbeat(
+            worker_id,
+            "accepted",
+            "heartbeat_recorded",
+            task_id=task_id,
+            state=state,
+        )
+
+    def stale_heartbeats(self, timeout: Optional[float] = None) -> List[Dict]:
+        max_age = self.heartbeat_timeout if timeout is None else timeout
+        now = self._clock()
+        return [
+            heartbeat
+            for heartbeat in self._heartbeats.values()
+            if now - heartbeat["monotonic_seen_at"] > max_age
+        ]
+
+    def expire_stale_heartbeats(
+        self,
+        timeout: Optional[float] = None,
+    ) -> List[Dict]:
+        expired = self.stale_heartbeats(timeout)
+        audits = []
+        for heartbeat in expired:
+            worker_id = heartbeat["worker_id"]
+            self._heartbeats.pop(worker_id, None)
+            audits.append(
+                self._audit_heartbeat(
+                    worker_id,
+                    "expired",
+                    "heartbeat_timeout",
+                    task_id=heartbeat.get("task_id"),
+                    state=heartbeat.get("state"),
+                )
+            )
+        return audits
+
+    def get_heartbeat(self, worker_id: str) -> Optional[Dict]:
+        return self._heartbeats.get(worker_id)
+
+    def heartbeat_audit(self) -> List[Dict]:
+        return list(self._heartbeat_audit)
+
+    def _audit_heartbeat(
+        self,
+        worker_id: str,
+        status: str,
+        reason: str,
+        task_id: Optional[str] = None,
+        state: Optional[str] = None,
+    ) -> Dict:
+        audit = {
+            "worker_id": worker_id,
+            "status": status,
+            "reason": reason,
+            "task_id": task_id,
+            "state": state,
+            "monotonic_at": self._clock(),
+            "wall_at": self._wall_clock(),
+        }
+        self._heartbeat_audit.append(audit)
+        return audit
 
 # 2019-04-25T08:37:12 update
 

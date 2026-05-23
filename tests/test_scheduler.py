@@ -1,5 +1,24 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
+
+
+class FakeClock:
+    def __init__(self):
+        self.monotonic_now = 100.0
+        self.wall_now = 1000.0
+
+    def monotonic(self):
+        return self.monotonic_now
+
+    def wall(self):
+        return self.wall_now
+
+    def advance_monotonic(self, seconds):
+        self.monotonic_now += seconds
+
+    def adjust_wall(self, seconds):
+        self.wall_now += seconds
 
 
 class TestTaskScheduler:
@@ -12,7 +31,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +38,68 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_tasks_use_monotonic_time(self):
+        clock = FakeClock()
+        scheduler = TaskScheduler(clock=clock.monotonic, wall_clock=clock.wall)
+
+        scheduler.schedule({"type": "scheduled"}, delay=10)
+        clock.adjust_wall(3600)
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        clock.advance_monotonic(10)
+        task = asyncio.run(scheduler.dequeue())
+        assert task["type"] == "scheduled"
+
+    def test_heartbeats_survive_backward_wall_clock_adjustment(self):
+        clock = FakeClock()
+        scheduler = TaskScheduler(
+            clock=clock.monotonic,
+            wall_clock=clock.wall,
+            heartbeat_timeout=30,
+        )
+
+        accepted = scheduler.record_heartbeat(
+            "worker-1",
+            task_id="task-1",
+            state="running",
+        )
+        clock.adjust_wall(-900)
+        clock.advance_monotonic(20)
+
+        assert accepted["status"] == "accepted"
+        assert scheduler.stale_heartbeats() == []
+        assert scheduler.get_heartbeat("worker-1")["task_id"] == "task-1"
+
+        clock.advance_monotonic(11)
+        expired = scheduler.expire_stale_heartbeats()
+        assert [audit["status"] for audit in expired] == ["expired"]
+        assert scheduler.get_heartbeat("worker-1") is None
+
+    def test_non_monotonic_heartbeat_is_rejected_without_state_change(self):
+        clock = FakeClock()
+        scheduler = TaskScheduler(clock=clock.monotonic, wall_clock=clock.wall)
+
+        scheduler.record_heartbeat("worker-1", task_id="task-1")
+        clock.advance_monotonic(-1)
+        rejected = scheduler.record_heartbeat("worker-1", task_id="task-2")
+
+        assert rejected["status"] == "rejected"
+        assert rejected["reason"] == "non_monotonic_heartbeat"
+        assert scheduler.get_heartbeat("worker-1")["task_id"] == "task-1"
+        assert scheduler.heartbeat_audit()[-1]["status"] == "rejected"
 
 # 2019-01-09T19:07:03 update
 
