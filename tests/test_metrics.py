@@ -1,5 +1,4 @@
-import pytest
-from src.common.metrics import MetricsCollector
+from src.common.metrics import MetricsCollector, metrics
 
 
 class TestMetricsCollector:
@@ -30,6 +29,50 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_reset_clears_all_collector_state(self):
+        self.metrics.increment("run.requests")
+        self.metrics.gauge("run.memory", 42.0)
+        self.metrics.observe("run.latency", 0.5)
+        self.metrics.start_timer("run.timer")
+
+        self.metrics.reset()
+
+        assert self.metrics.snapshot() == {
+            "counters": {},
+            "gauges": {},
+            "histograms": {},
+        }
+        assert self.metrics.stop_timer("run.timer") == 0.0
+
+    def test_reset_can_clear_only_scoped_metrics(self):
+        self.metrics.increment("agent.alpha.requests")
+        self.metrics.increment("agent.beta.requests")
+        self.metrics.gauge("agent.alpha.memory", 12.0)
+        self.metrics.gauge("agent.beta.memory", 24.0)
+        self.metrics.observe("agent.alpha.latency", 0.4)
+        self.metrics.observe("agent.beta.latency", 0.8)
+        self.metrics.start_timer("agent.alpha.timer")
+        self.metrics.start_timer("agent.beta.timer")
+
+        self.metrics.reset("agent.alpha.")
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["counters"] == {"agent.beta.requests": 1}
+        assert snapshot["gauges"] == {"agent.beta.memory": 24.0}
+        assert "agent.alpha.latency" not in snapshot["histograms"]
+        assert snapshot["histograms"]["agent.beta.latency"]["count"] == 1
+        assert self.metrics.stop_timer("agent.alpha.timer") == 0.0
+        assert self.metrics.stop_timer("agent.beta.timer") > 0.0
+
+    def test_module_level_metrics_can_be_reset_between_runs(self):
+        metrics.reset()
+        metrics.increment("short_lived.run")
+        assert metrics.snapshot()["counters"] == {"short_lived.run": 1}
+
+        metrics.reset()
+
+        assert metrics.snapshot()["counters"] == {}
 
 # 2019-07-16T09:29:21 update
 

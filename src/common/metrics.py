@@ -2,13 +2,13 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from threading import RLock
+from typing import Dict, List, Optional
 
 
 class MetricsCollector:
     def __init__(self):
-        self._lock = Lock()
+        self._lock = RLock()
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
@@ -38,13 +38,40 @@ class MetricsCollector:
                 return duration
         return 0.0
 
+    def reset(self, prefix: Optional[str] = None) -> None:
+        """Clear all metrics, or only metrics matching a scoped prefix."""
+        with self._lock:
+            if prefix is None:
+                self._counters.clear()
+                self._gauges.clear()
+                self._histograms.clear()
+                self._timers.clear()
+                return
+
+            scoped = str(prefix)
+            for store in (
+                self._counters,
+                self._gauges,
+                self._histograms,
+                self._timers,
+            ):
+                for metric in list(store):
+                    if metric.startswith(scoped):
+                        del store[metric]
+
     def snapshot(self) -> Dict:
         with self._lock:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
 
 
