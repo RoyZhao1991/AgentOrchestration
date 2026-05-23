@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from threading import RLock
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -32,54 +32,149 @@ class PriorityQueue:
 
 class TaskScheduler:
     def __init__(self):
+        self._lock = RLock()
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._cron_ticks: Dict[str, Dict[str, Any]] = {}
+        self._cron_leader_epochs: Dict[str, int] = {}
+        self.audit_records: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["enqueued_at"] = time.time()
+            task["retries"] = 0
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
-        return task_id
+            if queue not in self._queues:
+                self._queues[queue] = PriorityQueue()
+            self._queues[queue].push(task, priority)
+            return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = str(uuid4())
+            task["id"] = task_id
+            self._scheduled[task_id] = time.time() + delay
+            return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    def materialize_cron_tick(
+        self,
+        schedule_id: str,
+        tick_id: str,
+        leader_epoch: int,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            latest_epoch = self._cron_leader_epochs.get(schedule_id)
+            if latest_epoch is not None and leader_epoch < latest_epoch:
+                return self._record_cron_decision(
+                    schedule_id,
+                    tick_id,
+                    leader_epoch,
+                    "rejected",
+                    "stale_leader",
+                )
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+            dedupe_key = f"{schedule_id}:{tick_id}"
+            existing = self._cron_ticks.get(dedupe_key)
+            if existing:
+                return self._record_cron_decision(
+                    schedule_id,
+                    tick_id,
+                    leader_epoch,
+                    "rejected",
+                    "duplicate_tick",
+                    task_id=existing["task_id"],
+                )
+
+            task_id = self.enqueue(dict(task), queue=queue, priority=priority)
+            self._cron_ticks[dedupe_key] = {
+                "task_id": task_id,
+                "leader_epoch": leader_epoch,
+            }
+            self._cron_leader_epochs[schedule_id] = leader_epoch
+            return self._record_cron_decision(
+                schedule_id,
+                tick_id,
+                leader_epoch,
+                "accepted",
+                "materialized",
+                task_id=task_id,
+            )
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        with self._lock:
+            now = time.time()
+            expired = [
+                tid for tid, t in self._scheduled.items() if t <= now
+            ]
+            for tid in expired:
+                task = self._scheduled.pop(tid)
+                if task:
+                    self.enqueue(task, queue)
+
+            if queue in self._queues and len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if task:
+                    self._in_flight[task["id"]] = task
+                    return task
+            return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        with self._lock:
+            return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if task:
+                task["retries"] += 1
+                if task["retries"] < self._max_retries:
+                    self.enqueue(task, queue, priority=task.get("priority", 0))
+                    return True
+            return False
+
+    def _record_cron_decision(
+        self,
+        schedule_id: str,
+        tick_id: str,
+        leader_epoch: int,
+        decision: str,
+        reason: str,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        record = {
+            "component": "scheduler.cron_materializer",
+            "schedule_id": schedule_id,
+            "tick_id": tick_id,
+            "leader_epoch": leader_epoch,
+            "decision": decision,
+            "reason": reason,
+        }
+        if task_id is not None:
+            record["task_id"] = task_id
+        self.audit_records.append(record)
+        return dict(record)
 
 # 2019-04-25T08:37:12 update
 

@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,52 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_materialize_cron_tick_rejects_duplicate_replica_tick(self):
+        first = self.scheduler.materialize_cron_tick(
+            "billing-rollup",
+            "2026-05-23T00:00Z",
+            7,
+            {"type": "rollup"},
+        )
+        duplicate = self.scheduler.materialize_cron_tick(
+            "billing-rollup",
+            "2026-05-23T00:00Z",
+            7,
+            {"type": "rollup"},
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == first["task_id"]
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert duplicate["decision"] == "rejected"
+        assert duplicate["reason"] == "duplicate_tick"
+        assert duplicate["task_id"] == first["task_id"]
+        assert "payload" not in self.scheduler.audit_records[-1]
+
+    def test_materialize_cron_tick_rejects_stale_leader_epoch(self):
+        accepted = self.scheduler.materialize_cron_tick(
+            "billing-rollup",
+            "2026-05-23T00:00Z",
+            4,
+            {"type": "rollup"},
+        )
+        stale = self.scheduler.materialize_cron_tick(
+            "billing-rollup",
+            "2026-05-23T00:01Z",
+            3,
+            {"type": "rollup"},
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == accepted["task_id"]
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert stale["decision"] == "rejected"
+        assert stale["reason"] == "stale_leader"
+        assert "task_id" not in stale
+        assert "payload" not in self.scheduler.audit_records[-1]
 
 # 2019-01-09T19:07:03 update
 
