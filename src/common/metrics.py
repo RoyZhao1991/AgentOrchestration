@@ -3,12 +3,12 @@
 import time
 from collections import defaultdict
 from typing import Dict, List
-from threading import Lock
+from threading import RLock
 
 
 class MetricsCollector:
     def __init__(self):
-        self._lock = Lock()
+        self._lock = RLock()
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
@@ -32,19 +32,33 @@ class MetricsCollector:
 
     def stop_timer(self, metric: str) -> float:
         with self._lock:
-            if metric in self._timers:
-                duration = time.time() - self._timers.pop(metric)
+            started_at = self._timers.pop(metric, None)
+            if started_at is not None:
+                duration = time.time() - started_at
                 self.observe(metric, duration)
                 return duration
         return 0.0
+
+    def _histogram_snapshot(self, values: List[float]) -> Dict[str, float]:
+        count = len(values)
+        total = sum(values)
+        return {
+            "count": count,
+            "sum": total,
+            "avg": total / count if count else 0,
+            "min": min(values) if values else 0,
+            "max": max(values) if values else 0,
+        }
 
     def snapshot(self) -> Dict:
         with self._lock:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: self._histogram_snapshot(v)
+                    for k, v in self._histograms.items()
+                },
             }
 
 
