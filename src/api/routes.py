@@ -1,22 +1,33 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Body, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.webhooks import (
+    WebhookFilterError,
+    webhook_registry,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +64,87 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/webhook-subscriptions")
+async def register_webhook_subscription(
+    workspace_id: str,
+    callback_url: str,
+    filters: Optional[Dict] = Body(default=None),
+):
+    try:
+        subscription = webhook_registry.register_subscription(
+            workspace_id,
+            callback_url,
+            filters or {},
+        )
+    except WebhookFilterError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"subscription": subscription}
+
+
+@router.patch("/webhook-subscriptions/{subscription_id}")
+async def rotate_webhook_subscription(
+    workspace_id: str,
+    subscription_id: str,
+    callback_url: Optional[str] = None,
+    filters: Optional[Dict] = Body(default=None),
+):
+    try:
+        subscription = webhook_registry.update_subscription(
+            workspace_id,
+            subscription_id,
+            callback_url=callback_url,
+            filters=filters,
+        )
+    except WebhookFilterError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    return {"subscription": subscription}
+
+
+@router.post("/webhook-subscriptions/{subscription_id}/disable")
+async def disable_webhook_subscription(
+    workspace_id: str,
+    subscription_id: str,
+):
+    disabled = webhook_registry.disable_subscription(
+        workspace_id,
+        subscription_id,
+    )
+    if not disabled:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    return {"status": "disabled"}
+
+
+@router.post("/webhook-deliveries/{delivery_id}")
+async def deliver_webhook_event(
+    workspace_id: str,
+    delivery_id: str,
+    event: Dict = Body(...),
+):
+    return {
+        "deliveries": webhook_registry.deliver_event(
+            workspace_id,
+            delivery_id,
+            event,
+        )
+    }
+
+
+@router.post("/webhook-deliveries/{delivery_id}/retry")
+async def retry_webhook_delivery(
+    workspace_id: str,
+    delivery_id: str,
+):
+    return {
+        "deliveries": webhook_registry.retry_delivery(
+            workspace_id,
+            delivery_id,
+        )
+    }
 
 # 2019-03-18T11:10:18 update
 
