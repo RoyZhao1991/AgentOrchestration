@@ -2,8 +2,26 @@
 
 import asyncio
 import time
+from enum import Enum
+from threading import RLock
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
+
+
+class ExecutionState(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATES = {
+    ExecutionState.COMPLETED,
+    ExecutionState.FAILED,
+    ExecutionState.CANCELLED,
+}
+TERMINAL_HEARTBEAT_STATUSES = {state.value for state in TERMINAL_STATES}
 
 
 class AgentExecutor:
@@ -12,24 +30,69 @@ class AgentExecutor:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self._states: Dict[str, ExecutionState] = {}
+        self._heartbeats: Dict[str, Dict[str, Any]] = {}
+        self._lock = RLock()
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
-        execution_id = str(uuid4())
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+        execution_id: Optional[str] = None,
+    ) -> str:
+        execution_id = execution_id or str(uuid4())
+        self._set_state(execution_id, ExecutionState.PENDING)
         async with self._semaphore:
             task_obj = asyncio.create_task(
                 self._run_execution(execution_id, agent_id, task, handler)
             )
-            self._active_tasks[execution_id] = task_obj
+            with self._lock:
+                self._active_tasks[execution_id] = task_obj
+                self._states[execution_id] = ExecutionState.RUNNING
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                self._record_terminal_result(
+                    execution_id,
+                    ExecutionState.COMPLETED,
+                    result,
+                )
+            except asyncio.CancelledError:
+                self._record_terminal_result(
+                    execution_id,
+                    ExecutionState.CANCELLED,
+                    self._terminal_payload(
+                        execution_id,
+                        agent_id,
+                        task,
+                        ExecutionState.CANCELLED,
+                        {"error": "execution cancelled"},
+                    ),
+                )
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._record_terminal_result(
+                    execution_id,
+                    ExecutionState.FAILED,
+                    self._terminal_payload(
+                        execution_id,
+                        agent_id,
+                        task,
+                        ExecutionState.FAILED,
+                        {"error": str(e)},
+                    ),
+                )
             finally:
-                self._active_tasks.pop(execution_id, None)
+                with self._lock:
+                    self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -37,26 +100,112 @@ class AgentExecutor:
             "execution_id": exec_id,
             "agent_id": agent_id,
             "task_id": task.get("id"),
+            "state": ExecutionState.COMPLETED.value,
             "result": result,
             "duration": duration,
             "timestamp": time.time(),
         }
 
+    def record_heartbeat(
+        self,
+        execution_id: str,
+        worker_id: Optional[str] = None,
+        status: str = "running",
+        details: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        with self._lock:
+            state = self._states.get(execution_id)
+            if state is None or state in TERMINAL_STATES:
+                return False
+            if execution_id not in self._active_tasks:
+                return False
+            if status.lower() in TERMINAL_HEARTBEAT_STATUSES:
+                return False
+            self._heartbeats[execution_id] = {
+                "execution_id": execution_id,
+                "worker_id": worker_id,
+                "status": status,
+                "details": dict(details or {}),
+                "timestamp": (
+                    timestamp if timestamp is not None else time.time()
+                ),
+            }
+            return True
+
+    def get_heartbeat(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            heartbeat = self._heartbeats.get(execution_id)
+            return dict(heartbeat) if heartbeat else None
+
+    def get_state(self, execution_id: str) -> Optional[ExecutionState]:
+        with self._lock:
+            return self._states.get(execution_id)
+
+    def is_active(self, execution_id: str) -> bool:
+        with self._lock:
+            return execution_id in self._active_tasks
+
     def get_result(self, execution_id: str) -> Optional[Any]:
-        return self._results.get(execution_id)
+        with self._lock:
+            result = self._results.get(execution_id)
+            return dict(result) if isinstance(result, dict) else result
 
     def cancel(self, execution_id: str) -> bool:
-        task = self._active_tasks.get(execution_id)
+        with self._lock:
+            task = self._active_tasks.get(execution_id)
         if task and not task.done():
             task.cancel()
             return True
         return False
 
     async def shutdown(self) -> None:
-        for task in self._active_tasks.values():
+        with self._lock:
+            tasks = list(self._active_tasks.values())
+        for task in tasks:
             task.cancel()
-        if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _set_state(self, execution_id: str, state: ExecutionState) -> None:
+        with self._lock:
+            self._states[execution_id] = state
+
+    def _record_terminal_result(
+        self,
+        execution_id: str,
+        state: ExecutionState,
+        result: Dict[str, Any],
+    ) -> bool:
+        if state not in TERMINAL_STATES:
+            raise ValueError("terminal result must use a terminal state")
+        with self._lock:
+            existing_state = self._states.get(execution_id)
+            if existing_state in TERMINAL_STATES:
+                return False
+            stored = dict(result)
+            stored["state"] = state.value
+            self._states[execution_id] = state
+            self._results[execution_id] = stored
+            return True
+
+    def _terminal_payload(
+        self,
+        execution_id: str,
+        agent_id: str,
+        task: Dict[str, Any],
+        state: ExecutionState,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        record = {
+            "execution_id": execution_id,
+            "agent_id": agent_id,
+            "task_id": task.get("id"),
+            "state": state.value,
+            "timestamp": time.time(),
+        }
+        record.update(payload)
+        return record
 
 # 2019-01-31T14:19:34 update
 
