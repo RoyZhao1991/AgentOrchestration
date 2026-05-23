@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,85 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_binds_worker_for_batch_acknowledgement(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        assert task["assigned_worker"] == "worker-a"
+
+    def test_batch_acknowledge_rejects_wrong_worker(self):
+        self.scheduler.enqueue({"type": "test", "payload": {"secret": "x"}})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        result = self.scheduler.batch_acknowledge(
+            [{"task_id": task["id"], "action": "complete"}],
+            worker_id="worker-b",
+        )
+
+        assert result["accepted"] == 0
+        assert result["rejected"] == 1
+        assert result["results"][0]["reason"] == "wrong_worker"
+        assert self.scheduler.complete(task["id"], worker_id="worker-a")
+
+    def test_batch_acknowledge_is_idempotent_for_duplicate_ack(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        acknowledgement = [{"task_id": task["id"], "action": "complete"}]
+
+        first = self.scheduler.batch_acknowledge(
+            acknowledgement,
+            worker_id="worker-a",
+        )
+        second = self.scheduler.batch_acknowledge(
+            acknowledgement,
+            worker_id="worker-a",
+        )
+
+        assert first["accepted"] == 1
+        assert first["results"][0]["reason"] == "acknowledged"
+        assert second["accepted"] == 1
+        assert second["results"][0]["reason"] == "already_acknowledged"
+
+    def test_batch_acknowledge_rejects_invalid_action_before_commit(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        result = self.scheduler.batch_acknowledge(
+            [{"task_id": task["id"], "action": "archive"}],
+            worker_id="worker-a",
+        )
+
+        assert result["accepted"] == 0
+        assert result["results"][0]["reason"] == "invalid_action"
+        assert self.scheduler.complete(task["id"], worker_id="worker-a")
+
+    def test_batch_acknowledge_audit_omits_payload_data(self):
+        self.scheduler.enqueue({"type": "test", "payload": {"secret": "x"}})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        self.scheduler.batch_acknowledge(
+            [{"task_id": task["id"], "action": "complete"}],
+            worker_id="worker-a",
+        )
+
+        audit_record = self.scheduler.ack_audit()[-1]
+        assert audit_record["task_id"] == task["id"]
+        assert audit_record["worker_id"] == "worker-a"
+        assert "payload" not in audit_record
+        assert "secret" not in audit_record
 
 # 2019-01-09T19:07:03 update
 
