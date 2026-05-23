@@ -1,9 +1,22 @@
 """REST API module for the orchestration platform."""
 
 from .server import create_app
+from .webhooks import (
+    DeliveryRecord,
+    WebhookEndpoint,
+    WebhookSecurityError,
+    WebhookSecurityGateway,
+)
 from .routes import router
 
-__all__ = ["create_app", "router"]
+__all__ = [
+    "create_app",
+    "router",
+    "DeliveryRecord",
+    "WebhookEndpoint",
+    "WebhookSecurityError",
+    "WebhookSecurityGateway",
+]
 
 # 2019-02-04T12:25:11 update
 
