@@ -1,4 +1,3 @@
-import pytest
 from src.common.metrics import MetricsCollector
 
 
@@ -30,6 +29,25 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_snapshot_formats_histograms_after_releasing_lock(self):
+        self.metrics.observe("response.time", 0.5)
+        formatter_called = []
+        original_formatter = self.metrics._format_histograms
+
+        def format_with_lock_probe(histograms):
+            lock_acquired = self.metrics._lock.acquire(blocking=False)
+            assert lock_acquired
+            self.metrics._lock.release()
+            formatter_called.append(True)
+            return original_formatter(histograms)
+
+        self.metrics._format_histograms = format_with_lock_probe
+
+        snapshot = self.metrics.snapshot()
+
+        assert formatter_called == [True]
+        assert snapshot["histograms"]["response.time"]["count"] == 1
 
 # 2019-07-16T09:29:21 update
 
