@@ -2,7 +2,12 @@
 
 import time
 import logging
-from typing import Callable
+from collections import OrderedDict
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
+from uuid import uuid4
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,13 +15,140 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class RequestContext:
+    correlation_id: str
+    workspace_id: str
+    active_role: str
+
+
+_request_context: ContextVar[Optional[RequestContext]] = ContextVar(
+    "request_context",
+    default=None,
+)
+
+
+def get_request_context() -> Optional[RequestContext]:
+    return _request_context.get()
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_protected = (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        )
+        if is_protected:
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
+
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    _SAFE_CORRELATION_CHARS = frozenset(
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
+        "-_.:"
+    )
+
+    def __init__(self, app, max_tracked_ids: int = 1024):
+        super().__init__(app)
+        self.max_tracked_ids = max_tracked_ids
+        self._correlation_scopes: OrderedDict[str, Tuple[str, str]] = (
+            OrderedDict()
+        )
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        correlation_id = self._correlation_id(request)
+        if not self._valid_correlation_id(correlation_id):
+            return Response(
+                status_code=400,
+                content="Invalid correlation ID",
+            )
+
+        context = RequestContext(
+            correlation_id=correlation_id,
+            workspace_id=self._workspace_id(request),
+            active_role=self._active_role(request),
+        )
+        allowed, reason = self._bind_correlation_scope(context)
+        token = _request_context.set(context)
+        try:
+            if not allowed:
+                logger.warning(
+                    "request_context_rejected correlation_id=%s reason=%s",
+                    context.correlation_id,
+                    reason,
+                )
+                response = Response(
+                    status_code=409,
+                    content="Correlation ID scope mismatch",
+                )
+            else:
+                try:
+                    response = await call_next(request)
+                except Exception:
+                    logger.error(
+                        "request_context_exception correlation_id=%s",
+                        context.correlation_id,
+                    )
+                    response = Response(
+                        status_code=500,
+                        content="Internal Server Error",
+                    )
+            response.headers["X-Correlation-ID"] = context.correlation_id
+            return response
+        finally:
+            _request_context.reset(token)
+
+    def _bind_correlation_scope(
+        self,
+        context: RequestContext,
+    ) -> Tuple[bool, str]:
+        scope = (context.workspace_id, context.active_role)
+        existing_scope = self._correlation_scopes.get(context.correlation_id)
+        if existing_scope and existing_scope != scope:
+            return False, "correlation_id_scope_mismatch"
+
+        self._correlation_scopes[context.correlation_id] = scope
+        self._correlation_scopes.move_to_end(context.correlation_id)
+        while len(self._correlation_scopes) > self.max_tracked_ids:
+            self._correlation_scopes.popitem(last=False)
+        return True, "scope_bound"
+
+    def _correlation_id(self, request: Request) -> str:
+        return request.headers.get("X-Correlation-ID") or uuid4().hex
+
+    def _workspace_id(self, request: Request) -> str:
+        return (
+            request.headers.get("X-Workspace-ID")
+            or request.headers.get("X-Tenant-ID")
+            or "anonymous"
+        )
+
+    def _active_role(self, request: Request) -> str:
+        return (
+            request.headers.get("X-Active-Role")
+            or request.headers.get("X-Role")
+            or "anonymous"
+        )
+
+    def _valid_correlation_id(self, correlation_id: str) -> bool:
+        return (
+            0 < len(correlation_id) <= 128
+            and all(char in self._SAFE_CORRELATION_CHARS
+                    for char in correlation_id)
+        )
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +158,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            request_time
+            for request_time in self._requests[client_ip]
+            if now - request_time < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +183,28 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        context = get_request_context()
+        correlation_id = context.correlation_id if context else "-"
+        workspace_id = context.workspace_id if context else "-"
+        active_role = context.active_role if context else "-"
+        logger.info(
+            "%s %s %s %.3fs correlation_id=%s workspace_id=%s role=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+            correlation_id,
+            workspace_id,
+            active_role,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
