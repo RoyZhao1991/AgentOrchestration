@@ -1,9 +1,10 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import hashlib
 import heapq
 import time
-from typing import Any, Dict, Optional
+from copy import deepcopy
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -21,6 +22,25 @@ class PriorityQueue:
             return heapq.heappop(self._queue)[2]
         return None
 
+    def pop_matching(self, predicate: Callable[[Any], bool]) -> Optional[Any]:
+        skipped = []
+        item = None
+
+        while self._queue:
+            entry = heapq.heappop(self._queue)
+            candidate = entry[2]
+            if predicate(candidate):
+                item = candidate
+                break
+            skipped.append(entry)
+
+        for entry in skipped:
+            heapq.heappush(self._queue, entry)
+        return item
+
+    def items(self) -> List[Any]:
+        return [entry[2] for entry in self._queue]
+
     def peek(self) -> Optional[Any]:
         if self._queue:
             return self._queue[0][2]
@@ -31,39 +51,165 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        resume_backlog_limit: int = 2,
+        time_fn: Callable[[], float] = time.time,
+    ):
+        if resume_backlog_limit < 1:
+            raise ValueError("resume_backlog_limit must be positive")
+
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._paused_tenants = set()
+        self._resume_plans: Dict[str, Dict[str, Any]] = {}
+        self._audit_events: List[Dict[str, Any]] = []
+        self._resume_backlog_limit = resume_backlog_limit
+        self._time_fn = time_fn
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["enqueued_at"] = self._time_fn()
+        task["retries"] = task.get("retries", 0)
+        task["priority"] = priority
+        task["queue"] = queue
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["queue"] = queue
+        task["priority"] = priority
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": self._time_fn() + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    def pause_tenant(self, tenant_id: str, release_id: str = "manual") -> None:
+        self._paused_tenants.add(tenant_id)
+        self._resume_plans.pop(tenant_id, None)
+        self._audit(
+            "paused",
+            tenant_id,
+            release_id,
+            reason="tenant_paused",
+        )
+
+    def resume_tenant(
+        self,
+        tenant_id: str,
+        release_id: str,
+        backlog_limit: Optional[int] = None,
+    ) -> bool:
+        if tenant_id not in self._paused_tenants:
+            self._audit(
+                "rejected",
+                tenant_id,
+                release_id,
+                reason="tenant_not_paused",
+            )
+            return False
+
+        limit = backlog_limit or self._resume_backlog_limit
+        if limit < 1:
+            raise ValueError("backlog_limit must be positive")
+
+        backlog = self._count_queued_tenant_tasks(tenant_id)
+        self._paused_tenants.remove(tenant_id)
+        self._resume_plans[tenant_id] = {
+            "release_id": release_id,
+            "available": min(limit, backlog),
+            "limit": limit,
+        }
+        self._audit(
+            "planned",
+            tenant_id,
+            release_id,
+            reason="tenant_resumed",
+            backlog=backlog,
+            allowed=min(limit, backlog),
+        )
+        return True
+
+    def advance_resume_window(
+        self,
+        tenant_id: str,
+        release_id: str,
+        backlog_limit: Optional[int] = None,
+    ) -> bool:
+        plan = self._resume_plans.get(tenant_id)
+        if plan is None:
+            self._audit(
+                "rejected",
+                tenant_id,
+                release_id,
+                reason="missing_resume_plan",
+            )
+            return False
+
+        limit = backlog_limit or plan["limit"]
+        if limit < 1:
+            raise ValueError("backlog_limit must be positive")
+
+        backlog = self._count_queued_tenant_tasks(tenant_id)
+        plan["release_id"] = release_id
+        plan["available"] += min(limit, backlog)
+        self._audit(
+            "advanced",
+            tenant_id,
+            release_id,
+            reason="resume_window_advanced",
+            backlog=backlog,
+            allowed=min(limit, backlog),
+        )
+        return True
+
+    @property
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return [deepcopy(event) for event in self._audit_events]
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._time_fn()
+        expired = [
+            tid
+            for tid, record in self._scheduled.items()
+            if record["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            record = self._scheduled.pop(tid)
+            self.enqueue(
+                record["task"],
+                record["queue"],
+                priority=record["priority"],
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
+            task = self._queues[queue].pop_matching(self._can_dispatch)
             if task:
                 self._in_flight[task["id"]] = task
                 return task
@@ -80,6 +226,72 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _can_dispatch(self, task: Dict[str, Any]) -> bool:
+        tenant_id = task.get("tenant_id")
+        if not tenant_id:
+            return True
+
+        if tenant_id in self._paused_tenants:
+            self._audit(
+                "deferred",
+                tenant_id,
+                task.get("release_id", "unknown"),
+                reason="tenant_paused",
+            )
+            return False
+
+        plan = self._resume_plans.get(tenant_id)
+        if not plan:
+            return True
+
+        if plan["available"] <= 0:
+            self._audit(
+                "deferred",
+                tenant_id,
+                plan["release_id"],
+                reason="resume_window_exhausted",
+            )
+            return False
+
+        plan["available"] -= 1
+        self._audit(
+            "accepted",
+            tenant_id,
+            plan["release_id"],
+            reason="resume_window_available",
+            remaining_window=plan["available"],
+        )
+        return True
+
+    def _count_queued_tenant_tasks(self, tenant_id: str) -> int:
+        return sum(
+            1
+            for queue in self._queues.values()
+            for task in queue.items()
+            if task.get("tenant_id") == tenant_id
+        )
+
+    def _audit(
+        self,
+        decision: str,
+        tenant_id: str,
+        release_id: str,
+        **metadata: Any,
+    ) -> None:
+        event = {
+            "decision": decision,
+            "tenant_ref": self._tenant_ref(tenant_id),
+            "release_id": release_id,
+            "at": self._time_fn(),
+        }
+        event.update(metadata)
+        self._audit_events.append(event)
+
+    @staticmethod
+    def _tenant_ref(tenant_id: str) -> str:
+        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+        return digest[:12]
 
 # 2019-04-25T08:37:12 update
 

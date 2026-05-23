@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,94 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_paused_tenant_backlog_does_not_block_other_tenants(self):
+        self.scheduler.pause_tenant("tenant-a", release_id="deploy-old")
+        self.scheduler.enqueue(
+            {"type": "paused", "tenant_id": "tenant-a"},
+            priority=10,
+        )
+        self.scheduler.enqueue(
+            {"type": "ready", "tenant_id": "tenant-b"},
+            priority=1,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["type"] == "ready"
+        assert task["tenant_id"] == "tenant-b"
+
+    def test_resume_tenant_releases_bounded_backlog_without_burst(self):
+        scheduler = TaskScheduler(resume_backlog_limit=2)
+        scheduler.pause_tenant("tenant-a", release_id="deploy-old")
+        for index in range(3):
+            scheduler.enqueue(
+                {"type": f"backlog-{index}", "tenant_id": "tenant-a"},
+                priority=10 - index,
+            )
+
+        assert scheduler.resume_tenant(
+            "tenant-a",
+            release_id="deploy-new",
+        )
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue())
+        second = asyncio.run(scheduler.dequeue())
+        third = asyncio.run(scheduler.dequeue())
+
+        assert [first["type"], second["type"]] == ["backlog-0", "backlog-1"]
+        assert third is None
+        assert any(
+            event["reason"] == "resume_window_exhausted"
+            for event in scheduler.audit_events
+        )
+
+        assert scheduler.advance_resume_window(
+            "tenant-a",
+            release_id="deploy-new",
+            backlog_limit=1,
+        )
+        resumed = asyncio.run(scheduler.dequeue())
+        assert resumed["type"] == "backlog-2"
+
+    def test_resume_rejects_unpaused_tenant_without_mutating_queue(self):
+        self.scheduler.enqueue({"type": "ready", "tenant_id": "tenant-a"})
+
+        assert not self.scheduler.resume_tenant(
+            "tenant-a",
+            release_id="deploy-new",
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["type"] == "ready"
+        assert any(
+            event["reason"] == "tenant_not_paused"
+            for event in self.scheduler.audit_events
+        )
+
+    def test_resume_audit_omits_private_tenant_and_payload_data(self):
+        tenant_id = "workspace-secret-tenant"
+        self.scheduler.pause_tenant(tenant_id, release_id="deploy-old")
+        self.scheduler.enqueue(
+            {
+                "type": "backlog",
+                "tenant_id": tenant_id,
+                "payload": {"token": "private-token"},
+            }
+        )
+        self.scheduler.resume_tenant(tenant_id, release_id="deploy-new")
+
+        import asyncio
+        asyncio.run(self.scheduler.dequeue())
+
+        audit_text = str(self.scheduler.audit_events)
+        assert "workspace-secret-tenant" not in audit_text
+        assert "private-token" not in audit_text
+        assert "tenant_ref" in audit_text
+        assert "deploy-new" in audit_text
 
 # 2019-01-09T19:07:03 update
 
