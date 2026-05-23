@@ -2,13 +2,26 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from threading import RLock
+from typing import Dict, List, Optional
+
+
+DEFAULT_EXPORT_COUNTER_MAX = (2 ** 63) - 1
 
 
 class MetricsCollector:
-    def __init__(self):
-        self._lock = Lock()
+    def __init__(
+        self,
+        exporter_counter_max: Optional[int] = DEFAULT_EXPORT_COUNTER_MAX,
+    ):
+        if (
+            exporter_counter_max is not None
+            and exporter_counter_max < 0
+        ):
+            raise ValueError("exporter_counter_max must be non-negative")
+
+        self._lock = RLock()
+        self._exporter_counter_max = exporter_counter_max
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
@@ -38,14 +51,50 @@ class MetricsCollector:
                 return duration
         return 0.0
 
-    def snapshot(self) -> Dict:
+    def snapshot(
+        self,
+        exporter: bool = False,
+        max_counter_value: Optional[int] = None,
+    ) -> Dict:
         with self._lock:
-            return {
+            snapshot = {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
+        if exporter:
+            self._validate_export_counters(
+                snapshot["counters"],
+                max_counter_value,
+            )
+        return snapshot
+
+    def _validate_export_counters(
+        self,
+        counters: Dict[str, int],
+        max_counter_value: Optional[int],
+    ) -> None:
+        limit = (
+            self._exporter_counter_max
+            if max_counter_value is None
+            else max_counter_value
+        )
+        if limit is None:
+            return
+        if limit < 0:
+            raise ValueError("max_counter_value must be non-negative")
+        for metric, value in counters.items():
+            if value > limit:
+                raise ValueError(
+                    f"counter {metric}={value} exceeds exporter limit {limit}"
+                )
 
 
 metrics = MetricsCollector()
