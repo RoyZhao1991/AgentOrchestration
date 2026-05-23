@@ -55,6 +55,14 @@ Full documentation at [docs.agent-orchestrator.io](https://docs.agent-orchestrat
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
+## Docker Context Budget
+
+Docker image builds run a context audit before the build starts. The default
+context budget is 15 MiB, and generated/cache directories such as `.venv`,
+`__pycache__`, `dist`, `build`, `outputs`, `artifacts`, and `node_modules` must
+stay out of the build context. Run `python scripts/check_docker_context.py`
+locally to see the current size and largest included entries.
+
 ## Security
 
 Report vulnerabilities via our [bug bounty program](SECURITY.md).
