@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
@@ -47,6 +49,106 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_resolve_capability_uses_current_schema_contract(self):
+        schema_v1 = {
+            "version": 1,
+            "inputs": ["text"],
+        }
+        schema_v2 = {
+            "version": 2,
+            "inputs": ["text", "locale"],
+        }
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config={"capabilities": {"summarize": schema_v1}},
+        )
+
+        agent = self.registry.resolve_capability(
+            "summarize",
+            required_schema=schema_v1,
+        )
+        assert agent["id"] == agent_id
+
+        assert self.registry.update_capabilities(
+            agent_id,
+            {"summarize": schema_v2},
+        )
+
+        with pytest.raises(ValueError):
+            self.registry.resolve_capability(
+                "summarize",
+                required_schema=schema_v1,
+            )
+
+        agent = self.registry.resolve_capability(
+            "summarize",
+            required_schema=schema_v2,
+        )
+        assert agent["id"] == agent_id
+
+    def test_conflicting_active_capability_contract_is_rejected(self):
+        schema_v1 = {"version": 1, "inputs": ["text"]}
+        schema_v2 = {"version": 2, "inputs": ["text", "locale"]}
+        first_id = self.registry.register(
+            "first-agent",
+            "worker.processor",
+            config={"capabilities": {"summarize": schema_v1}},
+        )
+
+        with pytest.raises(ValueError):
+            self.registry.register(
+                "second-agent",
+                "worker.processor",
+                config={"capabilities": {"summarize": schema_v2}},
+            )
+
+        assert self.registry.count() == 1
+        resolved = self.registry.resolve_capability(
+            "summarize",
+            required_schema=schema_v1,
+        )
+        assert resolved["id"] == first_id
+
+    def test_capability_cache_invalidates_after_capability_removal(self):
+        schema = {"version": 1, "inputs": ["text"]}
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config={"capabilities": {"summarize": schema}},
+        )
+
+        assert self.registry.resolve_capability("summarize")["id"] == agent_id
+        assert self.registry.update_capabilities(agent_id, {})
+
+        assert self.registry.resolve_capability("summarize") is None
+
+    def test_schema_audit_records_do_not_expose_schema_payloads(self):
+        schema_v1 = {
+            "version": 1,
+            "private_field": "customer-secret-field",
+        }
+        schema_v2 = {
+            "version": 2,
+            "private_field": "new-secret-field",
+        }
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config={"capabilities": {"summarize": schema_v1}},
+        )
+
+        self.registry.update_capabilities(agent_id, {"summarize": schema_v2})
+
+        audit_text = json.dumps(
+            self.registry.audit_records(),
+            sort_keys=True,
+        )
+        assert "customer-secret-field" not in audit_text
+        assert "new-secret-field" not in audit_text
+        assert "private_field" not in audit_text
+        assert "fingerprint" in audit_text
 
 # 2019-01-23T10:28:57 update
 
