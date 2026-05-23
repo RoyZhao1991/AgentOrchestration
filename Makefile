@@ -21,7 +21,7 @@ run:
 	uvicorn src.api.server:create_app --reload --host 0.0.0.0 --port 8000
 
 docker-build:
-	docker compose -f infra/docker-compose.yml build
+	DOCKER_BUILDKIT=1 docker build --target runtime -t agent-orchestrator:latest .
 
 docker-up:
 	docker compose -f infra/docker-compose.yml up -d

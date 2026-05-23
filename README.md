@@ -51,6 +51,20 @@ ao status --watch
 
 Full documentation at [docs.agent-orchestrator.io](https://docs.agent-orchestrator.io)
 
+## Container Image Build
+
+The Docker image uses explicit dependency and runtime stages:
+
+- `dependencies` may reach external Python package indexes while it resolves and
+  builds wheels.
+- `runtime` copies only local wheels from `dependencies`, installs with
+  `--no-index`, and runs final import verification with Docker BuildKit
+  `RUN --network=none`.
+
+CI validates the Dockerfile policy before building the `runtime` target so
+final packaging cannot introduce package downloads, shell fetches, or other
+network-dependent commands after dependency resolution has completed.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.

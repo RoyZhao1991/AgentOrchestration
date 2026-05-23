@@ -27,3 +27,15 @@ jobs:
         run: uv run pytest --cov=src tests/
       - name: Lint
         run: uv run flake8 src/ tests/
+
+  docker-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Docker final stage network policy
+        run: python3 scripts/validate_docker_network_policy.py
+      - name: Build runtime image with network-disabled final stage
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build --target runtime -t agent-orchestrator:ci .
